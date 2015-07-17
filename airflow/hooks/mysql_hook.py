@@ -1,6 +1,6 @@
 from datetime import datetime
-import numpy
 import logging
+from itertools import izip_longest
 
 import MySQLdb
 
@@ -58,47 +58,49 @@ class MySqlHook(BaseHook):
         cur.close()
         conn.close()
 
+    def create_table(self, table, fields):
+        fields_s = ",\n  ".join([k + ' ' + v for k, v in fields.items()])
+        sql = ("CREATE TABLE IF NOT EXISTS {table} (\n{fields_s})\n"
+               "".format(**locals()))
+        self.run(sql)
+
+    def drop_table(self, table):
+        self.run("DROP TABLE IF EXISTS {}".format(table))
+
     def insert_rows(self, table, rows, target_fields=None, commit_every=1000):
         """
         A generic way to insert a set of tuples into a table,
         the whole set of inserts is treated as one transaction
         """
         if target_fields:
+            nfields = len(target_fields)
             target_fields = ", ".join(target_fields)
             target_fields = "({})".format(target_fields)
         else:
             target_fields = ''
+            nfields = len(rows[0])
+        valtemp_string = ", ".join(["%s"] * nfields)
         conn = self.get_conn()
         cur = conn.cursor()
         cur.execute('SET autocommit = 0')
         conn.commit()
-        i = 0
-        for row in rows:
-            i += 1
-            l = []
-            for cell in row:
-                if isinstance(cell, basestring):
-                    l.append("'" + str(cell).replace("'", "''") + "'")
-                elif cell is None:
-                    l.append('NULL')
-                elif isinstance(cell, numpy.datetime64):
-                    l.append("'" + str(cell) + "'")
-                elif isinstance(cell, datetime):
-                    l.append("'" + cell.isoformat() + "'")
-                else:
-                    l.append(str(cell))
-            values = tuple(l)
-            sql = "INSERT INTO {0} {1} VALUES ({2});".format(
+        sql = "INSERT INTO {0} {1} VALUES ({2})".format(
                 table,
                 target_fields,
-                ",".join(values))
-            cur.execute(sql)
-            if i % commit_every == 0:
+                valtemp_string)
+        nrows = len(rows)
+        if nrows < commit_every:
+            cur.executemany(sql, rows)
+        else:
+            i = 0
+            for row_batch in izip_longest(None, *[iter(rows)] * commit_every):
+                cur.executemany(sql, [r for r in row_batch if r is not None])
                 conn.commit()
+                i += 1
                 logging.info(
                     "Loaded {i} into {table} rows so far".format(**locals()))
         conn.commit()
         cur.close()
         conn.close()
         logging.info(
-            "Done loading. Loaded a total of {i} rows".format(**locals()))
+            "Done loading. Loaded a total of {nrows} rows".format(**locals()))
