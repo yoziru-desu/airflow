@@ -57,7 +57,10 @@ class DbApiHook(BaseHook):
         '''
         conn = self.get_conn()
         cur = self.get_cursor()
-        cur.execute(sql, parameters)
+        if parameters is not None:
+            cur.execute(sql, parameters)
+        else:
+            cur.execute(sql)
         rows = cur.fetchall()
         cur.close()
         conn.close()
@@ -69,7 +72,10 @@ class DbApiHook(BaseHook):
         '''
         conn = self.get_conn()
         cur = conn.cursor()
-        cur.execute(sql, parameters)
+        if parameters is not None:
+            cur.execute(sql, parameters)
+        else:
+            cur.execute(sql)
         rows = cur.fetchone()
         cur.close()
         conn.close()
@@ -95,7 +101,10 @@ class DbApiHook(BaseHook):
         cur = conn.cursor()
         for s in sql:
             logging.info(s)
-            cur.execute(s, parameters)
+            if parameters is not None:
+                cur.execute(s, parameters)
+            else:
+                cur.execute(s)
         cur.close()
         conn.commit()
         conn.close()
