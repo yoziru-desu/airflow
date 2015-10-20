@@ -1,0 +1,262 @@
+{% extends "airflow/dag.html" %}
+{% import 'admin/lib.html' as lib with context %}
+{% import 'admin/static.html' as admin_static with context %}
+
+{% block title %}Airflow - DAGs{% endblock %}
+
+{% block head_css %}
+{{ super() }}
+<link rel="stylesheet" type="text/css"
+    href="{{ url_for('static', filename='dagre.css') }}">
+<link rel="stylesheet" type="text/css"
+    href="{{ url_for('static', filename='graph.css') }}">
+<link href="{{ admin_static.url(filename='vendor/bootstrap-daterangepicker/daterangepicker-bs2.css') }}" rel="stylesheet">
+{% endblock %}
+
+{% block body %}
+{{ super() }}
+    {% if dag.doc_md %}
+        <div class="rich_doc" style="margin-bottom: 15px;">{{ doc_md|safe }}</div>
+    {% endif %}
+    <div class="form-inline">
+        <form method="get" style="float:left;">
+            Run:
+            {{ form.execution_date(class_="form-control") | safe }}
+            Layout:
+            {{ form.arrange(class_="form-control") | safe }}
+            <input type="hidden" name="root" value="{{ root }}">
+            <input type="hidden" value="{{ dag.dag_id }}" name="dag_id">
+            <input type="submit" value="Go" class="btn btn-default"
+            action="" method="get">
+        </form>
+            <div class="input-group" style="float: right;">
+              <input type="text" id="searchbox" class="form-control" placeholder="Search for..." onenter="null">
+            </div><!-- /input-group -->
+        <div style="clear: both;">
+
+    </div>
+<hr/>
+<div>
+    {% for op in operators %}
+    <div class="legend_item" style="border-width:1px;float:left;background:{{ op.ui_color }};color:{{ op.ui_fgcolor }};">
+        {{ op.__name__ }}
+    </div>
+    {% endfor %}
+
+    <div class="legend_item state" style="border-color:grey;">no status</div>
+    <div class="legend_item state" style="border-color:red;">failed</div>
+    <div class="legend_item state" style="border-color:lime;">running</div>
+    <div class="legend_item state" style="border-color:green;">success</div>
+    <div style="clear:both;"></div>
+</div>
+<hr style="margin-bottom: 0px;"/>
+<div id="svg_container">
+    <svg width="{{ width }}" height="{{ height }}">
+      <g id='dig' transform="translate(20,20)"/>
+      <filter id="blur-effect-1">
+        <feGaussianBlur stdDeviation="3" />
+      </filter>
+  </svg>
+</div>
+<hr>
+{% endblock %}
+
+{% block tail %}
+    {{ super() }}
+
+    <script src="{{ url_for('static', filename='d3.v3.min.js') }}"></script>
+    <script src="{{ url_for('static', filename='dagre-d3.js') }}"></script>
+    <script src="{{ admin_static.url(
+      filename='vendor/bootstrap-daterangepicker/daterangepicker.js') }}"></script>
+    <script src="{{ admin_static.url(filename='admin/js/form-1.0.0.js') }}"></script>
+    <script>
+    var nodes = {{ nodes|safe }};
+    var edges = {{ edges|safe }};
+    var tasks = {{ tasks|safe }};
+    var task_instances = {{ task_instances|safe }};
+    var execution_date = "{{ execution_date }}";
+    var arrange = "{{ arrange }}";
+    var g = dagreD3.json.decode(nodes, edges);
+    var duration = 500;
+    var stateFocusMap = {'no status':false, 'failed':false, 'running':false, 'success': false}
+
+
+    var layout = dagreD3.layout().rankDir(arrange).nodeSep(15).rankSep(15);
+    var renderer = new dagreD3.Renderer();
+    renderer.layout(layout).run(g, d3.select("#dig"));
+
+    // Assigning css classes based on state to nodes for border coloring
+    $.each(task_instances, function(task_id, ti) {
+      $('tspan').filter(function(index) { return $(this).text() === task_id; })
+        .parent().parent().parent()
+        .attr("class", "node enter " + ti.state)
+        .attr("data-toggle", "tooltip")
+        .attr("title", function(d) {
+          // Tooltip
+          task = tasks[task_id];
+          tt = "Operator: " + task.task_type + "<br>";
+          tt += "State: " + ti.state + "<br>";
+          tt += "Start: " + ti.start_date + "<br>";
+          tt += "End: " + ti.end_date + "<br>";
+          tt += "Duration: " + ti.duration + "<br>";
+          return tt;
+        });
+    });
+    
+    d3.selectAll("g.node").on("click", function(d){
+        task = tasks[d];
+        if (task.task_type == "SubDagOperator")
+            call_modal(d, execution_date, true);
+        else
+            call_modal(d, execution_date);
+    });
+
+    {% if blur %}
+    d3.selectAll("text").attr("class", "blur");
+    {% endif %}
+
+    $("g.node").tooltip({
+      html: true,
+      container: "body",
+    });
+
+    d3.selectAll("div.legend_item.state")
+        .style("cursor", "pointer")
+        .on("mouseover", function(){
+            if(!stateIsSet()){
+                state = d3.select(this).text();
+                focusState(state);
+            }
+        })
+        .on("mouseout", function(){
+            if(!stateIsSet()){
+                clearFocus();
+            }
+        });
+
+    d3.selectAll("div.legend_item.state")
+        .on("click", function(){
+            state = d3.select(this).text();
+            color = d3.select(this).style("border-color");
+
+            if (!stateFocusMap[state]){
+                clearFocus();
+                focusState(state, this, color);
+                setFocusMap(state);
+
+            } else {
+                clearFocus();
+                setFocusMap();
+            }
+        });
+
+    d3.select("#searchbox").on("keyup", function(){
+        var s = document.getElementById("searchbox").value;
+        var match = null;
+
+        if (stateIsSet){
+            clearFocus();
+            setFocusMap();
+        }
+
+        d3.selectAll("g.nodes g.node").filter(function(d, i){
+            if (s==""){
+                d3.select("g.edgePaths")
+                    .transition().duration(duration)
+                    .style("opacity", 1);
+                d3.select(this)
+                    .transition().duration(duration)
+                    .style("opacity", 1)
+                    .selectAll("rect")
+                    .style("stroke-width", "2px");
+            }
+            else{ 
+                d3.select("g.edgePaths")
+                    .transition().duration(duration)
+                    .style("opacity", 0.2);
+                if (d.indexOf(s) > -1) {
+                    if (!match)
+                        match = this;
+                    d3.select(this)
+                        .transition().duration(duration)
+                        .style("opacity", 1)
+                        .selectAll("rect")
+                        .style("stroke-width", "10px");
+                }
+                else {
+                    d3.select(this)
+                        .transition()
+                        .style("opacity", 0.2).duration(duration)
+                        .selectAll("rect")
+                        .style("stroke-width", "2px");
+                }
+            }
+        });
+        if(match) {
+            var transform = d3.transform(d3.select(match).attr("transform"));
+            transform.translate = [
+                -transform.translate[0] + 520, 
+                -(transform.translate[1] - 400)
+            ];
+            transform.scale = [1, 1];
+            
+            d3.select("g.zoom")
+                .transition()
+                .attr("transform", transform.toString());
+            renderer.zoom_obj.translate(transform.translate);
+            renderer.zoom_obj.scale(1);
+        }
+    });
+
+    function clearFocus(){
+        d3.selectAll("g.node")
+            .transition(duration)
+            .style("opacity", 1);
+        d3.selectAll("g.node rect")
+            .transition(duration)
+            .style("stroke-width", "2px");
+        d3.select("g.edgePaths")
+            .transition().duration(duration)
+            .style("opacity", 1);
+        d3.selectAll("div.legend_item.state")
+            .style("background-color", null);
+    }
+
+    function focusState(state, node, color){
+        d3.selectAll("g.node")
+            .transition(duration)
+            .style("opacity", 0.2);
+        d3.selectAll("g.node."+state)
+            .transition(duration)
+            .style("opacity", 1);
+        d3.selectAll("g.node." + state + " rect")
+            .transition(duration)
+            .style("stroke-width", "10px")
+            .style("opacity", 1);
+        d3.select("g.edgePaths")
+            .transition().duration(duration)
+            .style("opacity", 0.2);
+        d3.select(node)
+            .style("background-color", color);
+    }
+
+    function setFocusMap(state){
+        for (var key in stateFocusMap){
+                stateFocusMap[key] = false;
+        }
+        if(state != null){
+            stateFocusMap[state] = true;
+        }
+    }
+
+    function stateIsSet(){
+        for (var key in stateFocusMap){
+            if (stateFocusMap[key]){
+                return true
+            }
+        }
+        return false
+    }
+
+    </script>
+{% endblock %}

@@ -1,0 +1,34 @@
+g.node rect {
+    stroke-width: 2;
+    stroke: #CCC;
+    cursor: pointer;
+}
+g.node text {
+    cursor: pointer;
+}
+g.node.success rect {
+    stroke: green;
+}
+g.node.up_for_retry rect {
+    stroke: gold;
+}
+g.node.running rect{
+    stroke: lime;
+}
+g.node.failed rect {
+    stroke: red;
+}
+g.node.shutdown rect{
+    stroke: blue;
+}
+g.node.upstream_failed rect{
+    stroke: orange;
+}
+g.node.skipped rect{
+    stroke: pink;
+}
+div#svg_container {
+ border: 1px solid black;
+ background-color: #EEE;
+ cursor: move;
+}

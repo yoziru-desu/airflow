@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Windows image file caches
 Thumbs.db
 ehthumbs.db
@@ -41,3 +42,28 @@ $RECYCLE.BIN/
 Network Trash Folder
 Temporary Items
 .apdisk
+=======
+*.bkp
+*.egg-info
+*.pyc
+.DS_Store
+.ipynb*
+.coverage
+airflow/www/static/coverage/
+airflow.db
+airflow.cfg
+airflow_login.py
+build
+cover
+dbinit.py
+docs/_*
+dist
+env
+initdb.py
+logs
+MANIFEST
+secrets.py
+sftp-config.json
+unittests.cfg
+error.log
+>>>>>>> refs/heads/pr/1
