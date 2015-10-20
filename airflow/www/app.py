@@ -1,18 +1,21 @@
 from __future__ import print_function
 from __future__ import division
 from builtins import str
+from past.builtins import basestring
 from past.utils import old_div
 import copy
 from datetime import datetime, timedelta
 import dateutil.parser
 from functools import wraps
 import inspect
+from itertools import chain, product
 import json
 import logging
 import os
 import socket
 import sys
 import time
+import traceback
 
 from flask._compat import PY2
 from flask import (
@@ -130,16 +133,31 @@ def pygment_html_render(s, lexer=lexers.TextLexer):
 def wrapped_markdown(s):
     return '<div class="rich_doc">' + markdown.markdown(s) + "</div>"
 
+def render(obj, lexer):
+    out = ""
+    if isinstance(obj, basestring):
+        out += pygment_html_render(obj, lexer)
+    elif isinstance(obj, (tuple, list)):
+        for i, s in enumerate(obj):
+            out += "<div>List item #{}</div>".format(i)
+            out += "<div>" + pygment_html_render(s, lexer) + "</div>"
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            out += '<div>Dict item "{}"</div>'.format(k)
+            out += "<div>" + pygment_html_render(v, lexer) + "</div>"
+    return out
+
+
 attr_renderer = {
-    'bash_command': lambda x: pygment_html_render(x, lexers.BashLexer),
-    'hql': lambda x: pygment_html_render(x, lexers.SqlLexer),
-    'sql': lambda x: pygment_html_render(x, lexers.SqlLexer),
-    'doc': lambda x: pygment_html_render(x, lexers.TextLexer),
-    'doc_json': lambda x: pygment_html_render(x, lexers.JsonLexer),
-    'doc_rst': lambda x: pygment_html_render(x, lexers.RstLexer),
-    'doc_yaml': lambda x: pygment_html_render(x, lexers.YamlLexer),
+    'bash_command': lambda x: render(x, lexers.BashLexer),
+    'hql': lambda x: render(x, lexers.SqlLexer),
+    'sql': lambda x: render(x, lexers.SqlLexer),
+    'doc': lambda x: render(x, lexers.TextLexer),
+    'doc_json': lambda x: render(x, lexers.JsonLexer),
+    'doc_rst': lambda x: render(x, lexers.RstLexer),
+    'doc_yaml': lambda x: render(x, lexers.YamlLexer),
     'doc_md': wrapped_markdown,
-    'python_callable': lambda x: pygment_html_render(
+    'python_callable': lambda x: render(
         inspect.getsource(x), lexers.PythonLexer),
 }
 
@@ -391,9 +409,6 @@ class Airflow(BaseView):
                 "Data has been truncated to {0}"
                 " rows. Expect incomplete results.").format(CHART_LIMIT)
 
-        def date_handler(obj):
-            return obj.isoformat() if hasattr(obj, 'isoformat') else obj
-
         if not payload['error'] and len(df) == 0:
             payload['error'] += "Empty result set. "
         elif (
@@ -437,7 +452,7 @@ class Airflow(BaseView):
                 payload['state'] = 'SUCCESS'
                 return Response(
                     response=json.dumps(
-                        payload, indent=4, default=date_handler),
+                        payload, indent=4, cls=utils.AirflowJsonEncoder),
                     status=200,
                     mimetype="application/json")
 
@@ -604,7 +619,8 @@ class Airflow(BaseView):
             payload['request_dict'] = request_dict
 
         return Response(
-            response=json.dumps(payload, indent=4, default=date_handler),
+            response=json.dumps(
+                payload, indent=4, cls=utils.AirflowJsonEncoder),
             status=200,
             mimetype="application/json")
 
@@ -668,7 +684,7 @@ class Airflow(BaseView):
 
         payload = {}
         for dag in dagbag.dags.values():
-            payload[dag.dag_id] = []
+            payload[dag.safe_dag_id] = []
             for state in states:
                 try:
                     count = data[dag.dag_id][state]
@@ -680,7 +696,7 @@ class Airflow(BaseView):
                     'dag_id': dag.dag_id,
                     'color': State.color(state)
                 }
-                payload[dag.dag_id].append(d)
+                payload[dag.safe_dag_id].append(d)
         return Response(
             response=json.dumps(payload, indent=4),
             status=200, mimetype="application/json")
@@ -701,7 +717,13 @@ class Airflow(BaseView):
 
     @app.errorhandler(404)
     def circles(self):
-        return render_template('airflow/circles.html'), 404
+        return render_template(
+            'airflow/circles.html', hostname=socket.gethostname()), 404
+
+    @app.errorhandler(500)
+    def show_traceback(self):
+        return render_template(
+            'airflow/traceback.html', info=traceback.format_exc()), 500
 
     @expose('/sandbox')
     @login_required
@@ -896,6 +918,8 @@ class Airflow(BaseView):
         confirmed = request.args.get('confirmed') == "true"
         upstream = request.args.get('upstream') == "true"
         downstream = request.args.get('downstream') == "true"
+        future = request.args.get('future') == "true"
+        past = request.args.get('past') == "true"
 
         if action == "run":
             from airflow.executors import DEFAULT_EXECUTOR as executor
@@ -916,9 +940,6 @@ class Airflow(BaseView):
             return redirect(origin)
 
         elif action == 'clear':
-            future = request.args.get('future') == "true"
-            past = request.args.get('past') == "true"
-
             dag = dag.sub_dag(
                 task_regex=r"^{0}$".format(task_id),
                 include_downstream=downstream,
@@ -954,9 +975,27 @@ class Airflow(BaseView):
 
                 return response
         elif action == 'success':
+            MAX_PERIODS = 1000
+
             # Flagging tasks as successful
             session = settings.Session()
             task_ids = [task_id]
+            end_date = ((dag.latest_execution_date or datetime.now())
+                        if future else execution_date)
+
+            if 'start_date' in dag.default_args:
+                start_date = dag.default_args['start_date']
+            elif dag.start_date:
+                start_date = dag.start_date
+            else:
+                start_date = execution_date
+
+            if execution_date < start_date or end_date < start_date:
+                flash("Selected date before DAG start date", 'error')
+                return redirect(origin)
+
+            start_date = execution_date if not past else start_date
+
             if downstream:
                 task_ids += [
                     t.task_id
@@ -966,25 +1005,39 @@ class Airflow(BaseView):
                     t.task_id
                     for t in task.get_flat_relatives(upstream=True)]
             TI = models.TaskInstance
+            dates = utils.date_range(start_date, end_date)
             tis = session.query(TI).filter(
                 TI.dag_id == dag_id,
-                TI.execution_date == execution_date,
+                TI.execution_date.in_(dates),
                 TI.task_id.in_(task_ids)).all()
+            tis_to_change = session.query(TI).filter(
+                TI.dag_id == dag_id,
+                TI.execution_date.in_(dates),
+                TI.task_id.in_(task_ids),
+                TI.state != State.SUCCESS).all()
+            tasks = list(product(task_ids, dates))
+            tis_to_create = list(
+                set(tasks) -
+                set([(ti.task_id, ti.execution_date) for ti in tis]))
+
+            tis_all_altered = list(chain(
+                [(ti.task_id, ti.execution_date) for ti in tis_to_change],
+                tis_to_create))
+
+            if len(tis_all_altered) > MAX_PERIODS:
+                flash("Too many tasks at once (>{0})".format(
+                    MAX_PERIODS), 'error')
+                return redirect(origin)
 
             if confirmed:
-
-                updated_task_ids = []
-                for ti in tis:
-                    updated_task_ids.append(ti.task_id)
+                for ti in tis_to_change:
                     ti.state = State.SUCCESS
-
                 session.commit()
 
-                to_insert = list(set(task_ids) - set(updated_task_ids))
-                for task_id in to_insert:
+                for task_id, task_execution_date in tis_to_create:
                     ti = TI(
                         task=dag.get_task(task_id),
-                        execution_date=execution_date,
+                        execution_date=task_execution_date,
                         state=State.SUCCESS)
                     session.add(ti)
                     session.commit()
@@ -992,19 +1045,19 @@ class Airflow(BaseView):
                 session.commit()
                 session.close()
                 flash("Marked success on {} task instances".format(
-                    len(task_ids)))
+                    len(tis_all_altered)))
 
                 return redirect(origin)
             else:
-                if not task_ids:
+                if not tis_all_altered:
                     flash("No task instances to mark as successful", 'error')
                     response = redirect(origin)
                 else:
                     tis = []
-                    for task_id in task_ids:
+                    for task_id, task_execution_date in tis_all_altered:
                         tis.append(TI(
                             task=dag.get_task(task_id),
-                            execution_date=execution_date,
+                            execution_date=task_execution_date,
                             state=State.SUCCESS))
                     details = "\n".join([str(t) for t in tis])
 
@@ -1032,26 +1085,36 @@ class Airflow(BaseView):
 
         session = settings.Session()
 
+        start_date = dag.start_date
+        if not start_date and 'start_date' in dag.default_args:
+            start_date = dag.default_args['start_date']
+
         base_date = request.args.get('base_date')
         num_runs = request.args.get('num_runs')
         num_runs = int(num_runs) if num_runs else 25
 
         if not base_date:
-            base_date = dag.latest_execution_date or datetime.now()
+            # New DAGs will not have a latest execution date
+            if dag.latest_execution_date:
+                base_date = dag.latest_execution_date + 2 * dag.schedule_interval
+            else:
+                base_date = datetime.now()
         else:
             base_date = dateutil.parser.parse(base_date)
-        base_date = utils.round_time(base_date, dag.schedule_interval)
-        form = TreeForm(data={'base_date': base_date, 'num_runs': num_runs})
 
         start_date = dag.start_date
         if not start_date and 'start_date' in dag.default_args:
             start_date = dag.default_args['start_date']
 
-        if start_date:
-            difference = base_date - start_date
-            offset = timedelta(seconds=int(difference.total_seconds() % dag.schedule_interval.total_seconds()))
-            base_date -= offset
-            base_date -= timedelta(microseconds=base_date.microsecond)
+        # if a specific base_date is requested, don't round it
+        if not request.args.get('base_date'):
+            if start_date:
+                base_date = utils.round_time(
+                    base_date, dag.schedule_interval, start_date)
+            else:
+                base_date = utils.round_time(base_date, dag.schedule_interval)
+
+        form = TreeForm(data={'base_date': base_date, 'num_runs': num_runs})
 
         from_date = (base_date - (num_runs * dag.schedule_interval))
 
@@ -1067,7 +1130,7 @@ class Airflow(BaseView):
         # expand/collapse functionality. After 5,000 nodes we stop and fall
         # back on a quick DFS search for performance. See PR #320.
         node_count = [0]
-        node_limit = 5000 / len(dag.roots)
+        node_limit = 5000 / max(1, len(dag.roots))
 
         def recurse_nodes(task, visited):
             visited.add(task)
@@ -1636,7 +1699,7 @@ class TaskInstanceModelView(ModelViewOnly):
     verbose_name = "task instance"
     column_filters = (
         'state', 'dag_id', 'task_id', 'execution_date', 'hostname',
-        'queue', 'pool', 'operator')
+        'queue', 'pool', 'operator', 'start_date', 'end_date')
     named_filter_urls = True
     column_formatters = dict(
         log=log_link, task_id=task_instance_link,
@@ -1645,13 +1708,14 @@ class TaskInstanceModelView(ModelViewOnly):
         execution_date=datetime_f,
         start_date=datetime_f,
         end_date=datetime_f,
+        queued_dttm=datetime_f,
         dag_id=dag_link, duration=duration_f)
     column_searchable_list = ('dag_id', 'task_id', 'state')
     column_default_sort = ('start_date', True)
     column_list = (
         'state', 'dag_id', 'task_id', 'execution_date', 'operator',
         'start_date', 'end_date', 'duration', 'job_id', 'hostname',
-        'unixname', 'priority_weight', 'queued_dttm', 'log')
+        'unixname', 'priority_weight', 'queue', 'queued_dttm', 'log')
     can_delete = True
     page_size = 500
 mv = TaskInstanceModelView(
@@ -1677,6 +1741,8 @@ class ConnectionModelView(wwwutils.SuperUserMixin, AirflowModelView):
         'password',
         'port',
         'extra',
+        'extra__jdbc__drv_path',
+        'extra__jdbc__drv_clsname',
     )
     verbose_name = "Connection"
     verbose_name_plural = "Connections"
@@ -1707,6 +1773,7 @@ class ConnectionModelView(wwwutils.SuperUserMixin, AirflowModelView):
             ('mysql', 'MySQL',),
             ('postgres', 'Postgres',),
             ('oracle', 'Oracle',),
+            ('vertica', 'Vertica',),
             ('presto', 'Presto',),
             ('s3', 'S3',),
             ('samba', 'Samba',),

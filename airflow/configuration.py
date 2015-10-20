@@ -46,6 +46,8 @@ defaults = {
         'parallelism': 32,
         'load_examples': True,
         'plugins_folder': None,
+        'security': None,
+        'donot_pickle': False,
     },
     'webserver': {
         'base_url': 'http://localhost:8080',
@@ -56,6 +58,7 @@ defaults = {
         'demo_mode': False,
         'secret_key': 'airflowified',
         'expose_config': False,
+        'threads': 4,
     },
     'scheduler': {
         'statsd_on': False,
@@ -73,6 +76,13 @@ defaults = {
     'smtp': {
         'smtp_starttls': True,
     },
+    'kerberos': {
+        'ccache': '/tmp/airflow_krb5_ccache',
+        'principal': 'airflow',                 # gets augmented with fqdn
+        'reinit_frequency': '3600',
+        'kinit_path': 'kinit',
+        'keytab': 'airflow.keytab',
+    }
 }
 
 DEFAULT_CONFIG = """\
@@ -112,6 +122,9 @@ plugins_folder = {AIRFLOW_HOME}/plugins
 # Secret key to save connection passwords in the db
 fernet_key = {FERNET_KEY}
 
+# Whether to disable pickling dags
+donot_pickle = False
+
 [webserver]
 # The base url of your website as airflow cannot guess what domain or
 # cname you are using. This is use in automated emails that
@@ -126,6 +139,9 @@ web_server_port = 8080
 
 # Secret key used to run your flask app
 secret_key = temporary_key
+
+# number of threads to run the Gunicorn web server
+thread = 4
 
 # Expose the configuration file in the web server
 expose_config = true
@@ -198,6 +214,36 @@ scheduler_heartbeat_sec = 5
 # statsd_host =  localhost
 # statsd_port =  8125
 # statsd_prefix = airflow
+
+[mesos]
+# Mesos master address which MesosExecutor will connect to.
+master = localhost:5050
+
+# The framework name which Airflow scheduler will register itself as on mesos
+framework_name = Airflow
+
+# Number of cpu cores required for running one task instance using
+# 'airflow run <dag_id> <task_id> <execution_date> --local -p <pickle_id>'
+# command on a mesos slave
+task_cpu = 1
+
+# Memory in MB required for running one task instance using
+# 'airflow run <dag_id> <task_id> <execution_date> --local -p <pickle_id>'
+# command on a mesos slave
+task_memory = 256
+
+# Enable framework checkpointing for mesos
+# See http://mesos.apache.org/documentation/latest/slave-recovery/
+checkpoint = False
+
+# Enable framework authentication for mesos
+# See http://mesos.apache.org/documentation/latest/configuration/
+authenticate = False
+
+# Mesos credentials, if authentication is enabled
+# default_principal = admin
+# default_secret = admin
+
 """
 
 TEST_CONFIG = """\
@@ -209,6 +255,7 @@ executor = SequentialExecutor
 sql_alchemy_conn = sqlite:///{AIRFLOW_HOME}/unittests.db
 unit_test_mode = True
 load_examples = True
+donot_pickle = False
 
 [webserver]
 base_url = http://localhost:8080

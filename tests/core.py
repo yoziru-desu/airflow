@@ -5,6 +5,7 @@ import unittest
 from airflow import configuration
 configuration.test_mode()
 from airflow import jobs, models, DAG, executors, utils, operators, hooks
+from airflow.configuration import conf
 from airflow.www.app import app
 
 NUM_EXAMPLE_DAGS = 6
@@ -26,8 +27,10 @@ class TransferTests(unittest.TestCase):
         configuration.test_mode()
         args = {'owner': 'airflow', 'start_date': datetime(2015, 1, 1)}
         dag = DAG(TEST_DAG_ID, default_args=args)
-        dag.clear(start_date=DEFAULT_DATE, end_date=datetime.now())
         self.dag = dag
+
+    def test_clear(self):
+        self.dag.clear(start_date=DEFAULT_DATE, end_date=datetime.now())
 
     def test_mysql_to_hive(self):
         sql = "SELECT * FROM task_instance LIMIT 1000;"
@@ -97,6 +100,11 @@ class HivePrestoTest(unittest.TestCase):
             task_id='basic_hql', hql=self.hql, dag=self.dag)
         t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
 
+    def test_hive_dryrun(self):
+        t = operators.HiveOperator(
+            task_id='basic_hql', hql=self.hql, dag=self.dag)
+        t.dry_run()
+
     def test_beeline(self):
         t = operators.HiveOperator(
             task_id='beeline_hql', hive_cli_conn_id='beeline_default',
@@ -142,13 +150,14 @@ class HivePrestoTest(unittest.TestCase):
         t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
 
     def test_hive2samba(self):
-        t = operators.Hive2SambaOperator(
-            task_id='hive2samba_check',
-            samba_conn_id='tableau_samba',
-            hql="SELECT * FROM airflow.static_babynames LIMIT 10000",
-            destination_filepath='test_airflow.csv',
-            dag=self.dag)
-        t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
+        if 'Hive2SambaOperator' in dir(operators):
+            t = operators.Hive2SambaOperator(
+                task_id='hive2samba_check',
+                samba_conn_id='tableau_samba',
+                hql="SELECT * FROM airflow.static_babynames LIMIT 10000",
+                destination_filepath='test_airflow.csv',
+                dag=self.dag)
+            t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
 
     def test_hive_to_mysql(self):
         t = operators.HiveToMySqlTransfer(
@@ -169,6 +178,29 @@ class HivePrestoTest(unittest.TestCase):
         t.clear(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE)
         t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
 
+    def test_hive_to_mysql_bulk(self):
+        t = operators.HiveToMySqlTransfer(
+            mysql_conn_id='airflow_db',
+            task_id='hive_to_mysql_bulk_check',
+            create=True,
+            sql="""
+            SELECT name, gender
+            FROM airflow.static_babynames
+            LIMIT 100
+            """,
+            mysql_table='test_static_babynames',
+            mysql_preoperator=[
+                'DROP TABLE IF EXISTS test_static_babynames;',
+                """
+                CREATE TABLE test_static_babynames (
+                    name VARCHAR(500),
+                    gender VARCHAR(500)
+                )""",
+            ],
+            bulk_load=True,
+            dag=self.dag)
+        t.clear(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE)
+        t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
 
 class CoreTest(unittest.TestCase):
 
@@ -184,6 +216,10 @@ class CoreTest(unittest.TestCase):
 
     def test_confirm_unittest_mod(self):
         assert configuration.conf.get('core', 'unit_test_mode')
+
+    def test_pickling(self):
+        dp = self.dag.pickle()
+        assert self.dag.dag_id == dp.pickle.dag_id
 
     def test_rich_comparison_ops(self):
 
@@ -270,6 +306,13 @@ class CoreTest(unittest.TestCase):
             dag=self.dag)
         t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
 
+    def test_dryrun(self):
+        t = operators.BashOperator(
+            task_id='time_sensor_check',
+            bash_command="echo success",
+            dag=self.dag)
+        t.dry_run()
+
     def test_sqlite(self):
         t = operators.SqliteOperator(
             task_id='time_sqlite',
@@ -312,6 +355,40 @@ class CoreTest(unittest.TestCase):
             utils.AirflowTaskTimeout,
             t.run,
             start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
+
+    def test_python_op(self):
+        def test_py_op(templates_dict, ds, **kwargs):
+            if not templates_dict['ds'] == ds:
+                raise Exception("failure")
+        t = operators.PythonOperator(
+            task_id='test_py_op',
+            provide_context=True,
+            python_callable=test_py_op,
+            templates_dict={'ds': "{{ ds }}"},
+            dag=self.dag)
+        t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
+
+
+    def test_complex_template(self):
+        class OperatorSubclass(operators.BaseOperator):
+            template_fields = ['some_templated_field']
+            def __init__(self, some_templated_field, *args, **kwargs):
+                super(OperatorSubclass, self).__init__(*args, **kwargs)
+                self.some_templated_field = some_templated_field
+            def execute(*args, **kwargs):
+                pass
+        def test_some_templated_field_template_render(context):
+            self.assertEqual(context['ti'].task.some_templated_field['bar'][1], context['ds'])
+        t = OperatorSubclass(
+            task_id='test_complex_template',
+            provide_context=True,
+            some_templated_field={
+                'foo':'123',
+                'bar':['baz', '{{ ds }}']
+            },
+            on_success_callback=test_some_templated_field_template_render,
+            dag=self.dag)
+        t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
 
     def test_import_examples(self):
         self.assertEqual(len(self.dagbag.dags), NUM_EXAMPLE_DAGS)
@@ -590,8 +667,14 @@ class ConnectionTest(unittest.TestCase):
         os.environ['AIRFLOW_CONN_TEST_URI'] = \
             'postgres://username:password@ec2.compute.com:5432/the_database'
 
+    def tearDown(self):
+        env_vars = ['AIRFLOW_CONN_TEST_URI', 'AIRFLOW_CONN_AIRFLOW_DB']
+        for ev in env_vars:
+            if ev in os.environ:
+                del os.environ[ev]
+
     def test_using_env_var(self):
-        c = hooks.PostgresHook.get_connection(conn_id='test_uri')
+        c = hooks.SqliteHook.get_connection(conn_id='test_uri')
         assert c.host == 'ec2.compute.com'
         assert c.schema == 'the_database'
         assert c.login == 'username'
@@ -599,7 +682,7 @@ class ConnectionTest(unittest.TestCase):
         assert c.port == 5432
 
     def test_using_unix_socket_env_var(self):
-        c = hooks.PostgresHook.get_connection(conn_id='test_uri')
+        c = hooks.SqliteHook.get_connection(conn_id='test_uri')
         assert c.host == '/var/postgresql'
         assert c.schema == 'the_database'
         assert c.login is None
@@ -617,12 +700,12 @@ class ConnectionTest(unittest.TestCase):
         assert c.port is None
 
     def test_env_var_priority(self):
-        c = hooks.PostgresHook.get_connection(conn_id='airflow_db')
+        c = hooks.SqliteHook.get_connection(conn_id='airflow_db')
         assert c.host != 'ec2.compute.com'
 
         os.environ['AIRFLOW_CONN_AIRFLOW_DB'] = \
             'postgres://username:password@ec2.compute.com:5432/the_database'
-        c = hooks.PostgresHook.get_connection(conn_id='airflow_db')
+        c = hooks.SqliteHook.get_connection(conn_id='airflow_db')
         assert c.host == 'ec2.compute.com'
         assert c.schema == 'the_database'
         assert c.login == 'username'

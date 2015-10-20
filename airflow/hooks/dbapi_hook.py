@@ -20,8 +20,6 @@ class DbApiHook(BaseHook):
     supports_autocommit = False
     # Override with the object that exposes the connect method
     connector = None
-    # Whether the db supports a special type of autocmmit
-    supports_autocommit = False
 
     def __init__(self, *args, **kwargs):
         if not self.conn_name_attr:
@@ -49,7 +47,7 @@ class DbApiHook(BaseHook):
         '''
         import pandas.io.sql as psql
         conn = self.get_conn()
-        df = psql.read_sql(sql, con=conn)
+        df = psql.read_sql(sql, con=conn, params=parameters)
         conn.close()
         return df
 
@@ -59,7 +57,7 @@ class DbApiHook(BaseHook):
         '''
         conn = self.get_conn()
         cur = self.get_cursor()
-        cur.execute(sql)
+        cur.execute(sql, parameters)
         rows = cur.fetchall()
         cur.close()
         conn.close()
@@ -71,7 +69,7 @@ class DbApiHook(BaseHook):
         '''
         conn = self.get_conn()
         cur = conn.cursor()
-        cur.execute(sql)
+        cur.execute(sql, parameters)
         rows = cur.fetchone()
         cur.close()
         conn.close()
@@ -96,9 +94,10 @@ class DbApiHook(BaseHook):
 
         cur = conn.cursor()
         for s in sql:
-            cur.execute(s)
-        conn.commit()
+            logging.info(s)
+            cur.execute(s, parameters)
         cur.close()
+        conn.commit()
         conn.close()
 
     def set_autocommit(self, conn, autocommit):
@@ -154,8 +153,9 @@ class DbApiHook(BaseHook):
         logging.info(
             "Done loading. Loaded a total of {i} rows".format(**locals()))
 
-    def get_conn(self):
+
+    def bulk_load(self, table, tmp_file):
         """
-        Retuns a sql connection that can be used to retrieve a cursor.
+        Loads a tab-delimited file into a database table
         """
         raise NotImplemented()

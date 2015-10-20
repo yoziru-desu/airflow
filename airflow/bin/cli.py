@@ -1,13 +1,13 @@
 #!/usr/bin/env python
 from __future__ import print_function
-from builtins import input
-import argparse
-import dateutil.parser
-from datetime import datetime
 import logging
 import os
 import subprocess
 import sys
+
+from builtins import input
+import argparse
+import dateutil.parser
 
 import airflow
 from airflow import jobs, settings, utils
@@ -15,7 +15,6 @@ from airflow.configuration import conf
 from airflow.executors import DEFAULT_EXECUTOR
 from airflow.models import DagBag, TaskInstance, DagPickle
 from airflow.utils import AirflowException
-
 
 DAGS_FOLDER = os.path.expanduser(conf.get('core', 'DAGS_FOLDER'))
 
@@ -56,14 +55,23 @@ def backfill(args):
         dag = dag.sub_dag(
             task_regex=args.task_regex,
             include_upstream=not args.ignore_dependencies)
-    dag.run(
-        start_date=args.start_date,
-        end_date=args.end_date,
-        mark_success=args.mark_success,
-        include_adhoc=args.include_adhoc,
-        local=args.local,
-        donot_pickle=args.donot_pickle,
-        ignore_dependencies=args.ignore_dependencies)
+
+    if args.dry_run:
+        print("Dry run of DAG {0} on {1}".format(args.dag_id,
+                                                 args.start_date))
+        for task in dag.tasks:
+            print("Task {0}".format(task.task_id))
+            ti = TaskInstance(task, args.start_date)
+            ti.dry_run()
+    else:
+        dag.run(
+            start_date=args.start_date,
+            end_date=args.end_date,
+            mark_success=args.mark_success,
+            include_adhoc=args.include_adhoc,
+            local=args.local,
+            donot_pickle=(args.donot_pickle or conf.getboolean('core', 'donot_pickle')),
+            ignore_dependencies=args.ignore_dependencies)
 
 
 def run(args):
@@ -201,7 +209,11 @@ def test(args):
     dag = dagbag.dags[args.dag_id]
     task = dag.get_task(task_id=args.task_id)
     ti = TaskInstance(task, args.execution_date)
-    ti.run(force=True, ignore_dependencies=True, test_mode=True)
+
+    if args.dry_run:
+        ti.dry_run()
+    else:
+        ti.run(force=True, ignore_dependencies=True, test_mode=True)
 
 
 def clear(args):
@@ -237,6 +249,7 @@ def webserver(args):
     print(settings.HEADER)
     log_to_stdout()
     from airflow.www.app import app
+    threads = args.threads or conf.get('webserver', 'threads')
     if args.debug:
         print(
             "Starting the web server on port {0} and host {1}.".format(
@@ -244,14 +257,13 @@ def webserver(args):
         app.run(debug=True, port=args.port, host=args.hostname)
     else:
         print(
-            'Running Tornado server on host {host} and port {port}...'.format(
-                host=args.hostname, port=args.port))
-        from tornado.httpserver import HTTPServer
-        from tornado.ioloop import IOLoop
-        from tornado.wsgi import WSGIContainer
-        http_server = HTTPServer(WSGIContainer(app))
-        http_server.listen(args.port)
-        IOLoop.instance().start()
+            'Running the Gunicorn server with {threads}'
+            'on host {args.hostname} and port '
+            '{args.port}...'.format(**locals()))
+        sp = subprocess.Popen([
+            'gunicorn', '-w', str(args.threads), '-t', '120', '-b',
+            args.hostname + ':' + str(args.port), 'airflow.www.app:app'])
+        sp.wait()
 
 
 def scheduler(args):
@@ -260,7 +272,8 @@ def scheduler(args):
     job = jobs.SchedulerJob(
         dag_id=args.dag_id,
         subdir=args.subdir,
-        num_runs=args.num_runs)
+        num_runs=args.num_runs,
+        do_pickle=args.do_pickle)
     job.run()
 
 
@@ -344,6 +357,13 @@ def flower(args):
     sp.wait()
 
 
+def kerberos(args):
+    print(settings.HEADER)
+    log_to_stdout()
+    import airflow.security.kerberos
+    airflow.security.kerberos.run()
+
+
 def get_parser():
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(help='sub-command help')
@@ -383,6 +403,8 @@ def get_parser():
     parser_backfill.add_argument(
         "-sd", "--subdir", help=subdir_help,
         default=DAGS_FOLDER)
+    parser_backfill.add_argument(
+        "-dr", "--dry_run", help="Perform a dry run", action="store_true")
     parser_backfill.set_defaults(func=backfill)
 
     ht = "Clear a set of task instance, as if they never ran"
@@ -467,6 +489,8 @@ def get_parser():
     parser_test.add_argument(
         "-sd", "--subdir", help=subdir_help,
         default=DAGS_FOLDER)
+    parser_test.add_argument(
+        "-dr", "--dry_run", help="Perform a dry run", action="store_true")
     parser_test.set_defaults(func=test)
 
     ht = "Get the status of a task instance."
@@ -488,6 +512,11 @@ def get_parser():
         type=int,
         help="Set the port on which to run the web server")
     parser_webserver.add_argument(
+        "-w", "--threads",
+        default=conf.get('webserver', 'THREADS'),
+        type=int,
+        help="Number of threads to run the webserver on")
+    parser_webserver.add_argument(
         "-hn", "--hostname",
         default=conf.get('webserver', 'WEB_SERVER_HOST'),
         help="Set the hostname on which to run the web server")
@@ -508,6 +537,14 @@ def get_parser():
         default=None,
         type=int,
         help="Set the number of runs to execute before exiting")
+    parser_scheduler.add_argument(
+        "-p", "--do_pickle",
+        default=False,
+        help=(
+            "Attempt to pickle the DAG object to send over "
+            "to the workers, instead of letting workers run their version "
+            "of the code."),
+        action="store_true")
     parser_scheduler.set_defaults(func=scheduler)
 
     ht = "Initialize the metadata database"
@@ -544,7 +581,7 @@ def get_parser():
     parser_worker = subparsers.add_parser('worker', help=ht)
     parser_worker.add_argument(
         "-q", "--queues",
-        help="Comma delimited list of queues to cater serve",
+        help="Comma delimited list of queues to serve",
         default=conf.get('celery', 'DEFAULT_QUEUE'))
     parser_worker.set_defaults(func=worker)
 
@@ -562,5 +599,15 @@ def get_parser():
 
     parser_version = subparsers.add_parser('version', help="Show version")
     parser_version.set_defaults(func=version)
+
+    ht = "Start a kerberos ticket renewer"
+    parser_kerberos = subparsers.add_parser('kerberos', help=ht)
+    parser_kerberos.add_argument(
+        "-kt", "--keytab", help="keytab",
+        nargs='?', default=conf.get('kerberos', 'keytab'))
+    parser_kerberos.add_argument(
+        "principal", help="kerberos principal",
+        nargs='?', default=conf.get('kerberos', 'principal'))
+    parser_kerberos.set_defaults(func=kerberos)
 
     return parser

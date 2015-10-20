@@ -178,7 +178,7 @@ class DagBag(object):
                     m = imp.load_source(mod_name, filepath)
             except Exception as e:
                 logging.error("Failed to import: " + filepath)
-                self.import_errors[filepath] = e
+                self.import_errors[filepath] = str(e)
                 logging.exception(e)
                 self.file_last_changed[filepath] = dttm
                 return
@@ -230,7 +230,7 @@ class DagBag(object):
             dag_folder=None,
             only_if_updated=True):
         """
-        Given a file path or a folder, this file looks for python modules,
+        Given a file path or a folder, this method looks for python modules,
         imports them and adds them to the dagbag collection.
 
         Note that if a .airflowignore file is found while processing,
@@ -388,6 +388,10 @@ class Connection(Base):
                 return hooks.JdbcHook(jdbc_conn_id=self.conn_id)
             elif self.conn_type == 'mssql':
                 return hooks.MsSqlHook(mssql_conn_id=self.conn_id)
+            elif self.conn_type == 'oracle':
+                return hooks.OracleHook(oracle_conn_id=self.conn_id)
+            elif self.conn_type == 'vertica':
+                return hooks.VerticaHook(vertica_conn_id=self.conn_id)
         except:
             return None
 
@@ -423,7 +427,7 @@ class DagPickle(Base):
     id = Column(Integer, primary_key=True)
     pickle = Column(PickleType(pickler=dill))
     created_dttm = Column(DateTime, default=func.now())
-    pickle_hash = Column(BigInteger)
+    pickle_hash = Column(Text)
 
     __tablename__ = "dag_pickle"
 
@@ -755,12 +759,12 @@ class TaskInstance(Base):
             )
             successes, skipped, failed, upstream_failed, done = qry.first()
             if flag_upstream_failed:
-                if skipped:
+                if skipped >= len(task._upstream_list):
                     self.state = State.SKIPPED
                     self.start_date = datetime.now()
                     self.end_date = datetime.now()
                     session.merge(self)
-                elif successes < done >= len(task._upstream_list):
+                elif failed + upstream_failed >= len(task._upstream_list):
                     self.state = State.UPSTREAM_FAILED
                     self.start_date = datetime.now()
                     self.end_date = datetime.now()
@@ -816,7 +820,8 @@ class TaskInstance(Base):
             .first()
         )
         if not pool:
-            return False
+            raise ValueError('Task specified a pool ({}) but the pool '
+                             'doesn\'t exist!').format(self.task.pool)
         open_slots = pool.open_slots(session=session)
 
         return open_slots <= 0
@@ -955,6 +960,15 @@ class TaskInstance(Base):
 
         session.commit()
 
+    def dry_run(self):
+        task = self.task
+        task_copy = copy.copy(task)
+        self.task = task_copy
+
+        self.render_templates()
+        task_copy.dry_run()
+
+
     def handle_failure(self, error, test_mode, context):
         logging.exception(error)
         task = self.task
@@ -1045,21 +1059,8 @@ class TaskInstance(Base):
         for attr in task.__class__.template_fields:
             content = getattr(task, attr)
             if content:
-                if isinstance(content, basestring):
-                    result = rt(content, jinja_context)
-                elif isinstance(content, (list, tuple)):
-                    result = [rt(s, jinja_context) for s in content]
-                elif isinstance(content, dict):
-                    result = {
-                        k: rt(v, jinja_context)
-                        for k, v in list(content.items())}
-                else:
-                    param_type = type(content)
-                    msg = (
-                        "Type '{param_type}' used for parameter '{attr}' is "
-                        "not supported for templating").format(**locals())
-                    raise AirflowException(msg)
-                setattr(task, attr, result)
+                rendered_content = self.task.render_template(content, jinja_context)
+                setattr(task, attr, rendered_content)
 
     def email_alert(self, exception, is_retry=False):
         task = self.task
@@ -1124,7 +1125,7 @@ class TaskInstance(Base):
         """
         Pull XComs that optionally meet certain criteria.
 
-        The default value for `key` ("{return_key}") limits the search to XComs
+        The default value for `key` limits the search to XComs
         that were returned by other tasks (as opposed to those that were pushed
         manually). To remove this filter, pass key=None (or any desired value).
 
@@ -1134,9 +1135,10 @@ class TaskInstance(Base):
         whenever no matches are found.
 
         :param key: A key for the XCom. If provided, only XComs with matching
-            keys will be returned. The default value is "{return_key}",
-            the key automatically given to XComs returned by tasks (as opposed
-            to being pushed manually). To remove the filter, pass key=None.
+            keys will be returned. The default key is 'return_value', also
+            available as a constant XCOM_RETURN_KEY. This key is automatically
+            given to XComs returned by tasks (as opposed to being pushed
+            manually). To remove the filter, pass key=None.
         :type key: string
         :param task_ids: Only XComs from tasks with matching ids will be
             pulled. Can pass None to remove the filter.
@@ -1151,7 +1153,7 @@ class TaskInstance(Base):
         :param limit: the maximum number of results to return. Pass None for
             no limit.
         :type limit: int
-        """.format(return_key=XCOM_RETURN_KEY)
+        """
 
         if dag_id is None:
             dag_id = self.dag_id
@@ -1229,8 +1231,20 @@ class BaseOperator(object):
     :type retries: int
     :param retry_delay: delay between retries
     :type retry_delay: timedelta
-    :param start_date: start date for the task, the scheduler will start from
-        this point in time
+    :param start_date: The ``start_date`` for the task, determines
+        the ``execution_date`` for the first task instanec. The best practice
+        is to have the start_date rounded
+        to your DAG's ``schedule_interval``. Daily jobs have their start_date
+        some day at 00:00:00, hourly jobs have their start_date at 00:00
+        of a specific hour. Note that Airflow simply looks at the latest
+        ``execution_date`` and adds the ``schedule_interval`` to determine
+        the next ``execution_date``. It is also very important
+        to note that different tasks' dependencies
+        need to line up in time. If task A depends on task B and their
+        start_date are offset in a way that their execution_date don't line
+        up, A's dependencies will never be met. If you are looking to delay
+        a task, for example running a daily task at 2AM, look into the
+        ``TimeSensor`` and ``TimeDeltaSensor``.
     :type start_date: datetime
     :param end_date: if specified, the scheduler won't go beyond this date
     :type end_date: datetime
@@ -1314,7 +1328,7 @@ class BaseOperator(object):
             retry_delay=timedelta(seconds=300),
             start_date=None,
             end_date=None,
-            schedule_interval=timedelta(days=1),  # not hooked as of now
+            schedule_interval=None,  # not hooked as of now
             depends_on_past=False,
             wait_for_downstream=False,
             dag=None,
@@ -1341,12 +1355,21 @@ class BaseOperator(object):
         self.email_on_retry = email_on_retry
         self.email_on_failure = email_on_failure
         self.start_date = start_date
+        if start_date and not isinstance(start_date, datetime):
+            logging.warning(
+                "start_date for {} isn't datetime.datetime".format(self))
         self.end_date = end_date
         self.trigger_rule = trigger_rule
         self.depends_on_past = depends_on_past
         self.wait_for_downstream = wait_for_downstream
         if wait_for_downstream:
             self.depends_on_past = True
+
+        if schedule_interval:
+            logging.warning(
+                "schedule_interval is used for {}, though it has "
+                "been deprecated as a task parameter, you need to "
+                "specify it as a DAG parameter instead".format(self))
         self._schedule_interval = schedule_interval
         self.retries = retries
         self.queue = queue
@@ -1471,6 +1494,7 @@ class BaseOperator(object):
         Hack sorting double chained task lists by task_id to avoid hitting
         max_depth on deepcopy operations.
         """
+        sys.setrecursionlimit(5000)  # TODO fix this in a better way
         cls = self.__class__
         result = cls.__new__(cls)
         memo[id(self)] = result
@@ -1480,21 +1504,45 @@ class BaseOperator(object):
         for k, v in list(self.__dict__.items()):
             if k not in ('user_defined_macros', 'params'):
                 setattr(result, k, copy.deepcopy(v, memo))
+        return result
 
+    def render_template_from_field(self, content, context, jinja_env):
+        '''
+        Renders a template from a field. If the field is a string, it will
+        simply render the string and return the result. If it is a collection or
+        nested set of collections, it will traverse the structure and render
+        all strings in it.
+        '''
+        rt = self.render_template
+        if isinstance(content, basestring):
+            result = jinja_env.from_string(content).render(**context)
+        elif isinstance(content, (list, tuple)):
+            result = [rt(e, context) for e in content]
+        elif isinstance(content, dict):
+            result = {
+                k: rt(v, context)
+                for k, v in list(content.items())}
+        else:
+            param_type = type(content)
+            msg = (
+                "Type '{param_type}' used for parameter '{attr}' is "
+                "not supported for templating").format(**locals())
+            raise AirflowException(msg)
         return result
 
     def render_template(self, content, context):
-        if hasattr(self, 'dag'):
-            env = self.dag.get_template_env()
-        else:
-            env = jinja2.Environment(cache_size=0)
+        '''
+        Renders a template either from a file or directly in a field, and returns
+        the rendered result.
+        '''
+        jinja_env = self.dag.get_template_env() \
+            if hasattr(self, 'dag') \
+            else jinja2.Environment(cache_size=0)
 
         exts = self.__class__.template_ext
-        if any([content.endswith(ext) for ext in exts]):
-            template = env.get_template(content)
-        else:
-            template = env.from_string(content)
-        return template.render(**context)
+        return jinja_env.get_template(content).render(**context) \
+            if isinstance(content, basestring) and any([content.endswith(ext) for ext in exts]) \
+            else self.render_template_from_field(content, context, jinja_env)
 
     def prepare_template(self):
         '''
@@ -1621,6 +1669,15 @@ class BaseOperator(object):
                 mark_success=mark_success,
                 ignore_dependencies=ignore_dependencies,
                 force=force,)
+
+    def dry_run(self):
+        logging.info('Dry run')
+        for attr in self.template_fields:
+            content = getattr(self, attr)
+            if content and isinstance(content, basestring):
+                logging.info('Rendering template for {0}'.format(attr))
+                logging.info(content)
+
 
     def get_direct_relatives(self, upstream=False):
         """
@@ -1765,8 +1822,11 @@ class DAG(object):
 
     :param dag_id: The id of the DAG
     :type dag_id: string
-    :param schedule_interval: Defines how often that DAG runs
-    :type schedule_interval: datetime.timedelta
+    :param schedule_interval: Defines how often that DAG runs, this
+        timedelta object gets added to your latest task instance's
+        execution_date to figure out the next schedule
+    :type schedule_interval: datetime.timedelta or
+        dateutil.relativedelta.relativedelta
     :param start_date: The timestamp from which the scheduler will
         attempt to backfill
     :type start_date: datetime.datetime
@@ -1822,6 +1882,7 @@ class DAG(object):
         self.template_searchpath = template_searchpath
         self.parent_dag = None  # Gets set when DAGs are loaded
         self.last_loaded = datetime.now()
+        self.safe_dag_id = dag_id.replace('.', '__dot__')
 
         self._comps = {
             'dag_id',
@@ -2104,7 +2165,7 @@ class DAG(object):
     def pickle(self, main_session=None):
         session = main_session or settings.Session()
         dag = session.query(
-            DagModel).filter(DAG.dag_id == self.dag_id).first()
+            DagModel).filter(DagModel.dag_id == self.dag_id).first()
         dp = None
         if dag and dag.pickle_id:
             dp = session.query(DagPickle).filter(
@@ -2118,6 +2179,7 @@ class DAG(object):
 
         if not main_session:
             session.close()
+        return dp
 
     def tree_view(self):
         """
@@ -2177,7 +2239,7 @@ class DAG(object):
     def run(
             self, start_date=None, end_date=None, mark_success=False,
             include_adhoc=False, local=False, executor=None,
-            donot_pickle=False, ignore_dependencies=False):
+            donot_pickle=conf.getboolean('core', 'donot_pickle'), ignore_dependencies=False):
         from airflow.jobs import BackfillJob
         if not executor and local:
             executor = LocalExecutor()
@@ -2263,9 +2325,15 @@ class Variable(Base):
 
     @classmethod
     @provide_session
-    def get(cls, key, session, deserialize_json=False):
+    def get(cls, key, default_var=None, deserialize_json=False, session=None):
         obj = session.query(cls).filter(cls.key == key).first()
-        v = obj.val
+        if obj is None:
+            if default_var is not None:
+                v = default_var
+            else:
+                raise ValueError('Variable {} does not exist'.format(key))
+        else:
+            v = obj.val
         if deserialize_json and v:
             v = json.loads(v)
         return v

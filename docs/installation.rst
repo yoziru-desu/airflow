@@ -31,6 +31,8 @@ Here's the list of the subpackages and what they enable:
 +-------------+------------------------------------+------------------------------------------------+
 |  samba      |  ``pip install airflow[samba]``    | ``Hive2SambaOperator``                         |
 +-------------+------------------------------------+------------------------------------------------+
+|  hive       |  ``pip install airflow[hive]``     | All Hive related operators                     |
++-------------+------------------------------------+------------------------------------------------+
 |  jdbc       |  ``pip install airflow[jdbc]``     | JDBC hooks and operators                       |
 +-------------+------------------------------------+------------------------------------------------+
 |  hdfs       |  ``pip install airflow[hdfs]``     | HDFS hooks and operators                       |
@@ -40,6 +42,9 @@ Here's the list of the subpackages and what they enable:
 |  druid      | ``pip install airflow[druid]``     | Druid.io related operators & hooks             |
 +-------------+------------------------------------+------------------------------------------------+
 |  mssql      |  ``pip install airflow[mssql]``    | Microsoft SQL operators and hook,              |
+|             |                                    | support as an Airflow backend                  |
++-------------+------------------------------------+------------------------------------------------+
+|  vertica    |  ``pip install airflow[vertica]``  | Vertica hook                                   |
 |             |                                    | support as an Airflow backend                  |
 +-------------+------------------------------------+------------------------------------------------+
 |  slack      | ``pip install airflow[slack]``     | ``SlackAPIPostOperator``                       |
@@ -86,7 +91,11 @@ library, you should be able to use any database backend supported as a
 SqlAlchemy backend. We recommend using **MySQL** or **Postgres**.
 
 .. note:: If you decide to use **Postgres**, we recommend using the ``psycopg2``
-   driver and specifying it in your SqlAlchemy connection string
+   driver and specifying it in your SqlAlchemy connection string.
+   Also note that since SqlAlchemy does not expose a way to target a
+   specific schema in the Postgres connection URI, you may
+   want to set a default schema for your role with a
+   command similar to ``ALTER ROLE username SET search_path = airflow, foobar;``
 
 Once you've setup your database to host Airflow, you'll need to alter the
 SqlAlchemy connection string located in your configuration file
@@ -119,8 +128,8 @@ Airflow with the value in a URI format to use the connection properly. Please
 see the :doc:`concepts` documentation for more information on environment
 variables and connections.
 
-Scaling Out
-'''''''''''
+Scaling Out with Celery
+'''''''''''''''''''''''
 CeleryExecutor is the way you can scale out the number of workers. For this
 to work, you need to setup a Celery backend (**RabbitMQ**, **Redis**, ...) and
 change your ``airflow.cfg`` to point the executor parameter to
@@ -142,6 +151,44 @@ its direction.
 Note that you can also run "Celery Flower", a web UI built on top of Celery,
 to monitor your workers.
 
+
+Scaling Out on Mesos (community contributed)
+''''''''''''''''''''''''''''''''''''''''''''
+MesosExecutor allows you to schedule airflow tasks on a Mesos cluster.
+For this to work, you need a running mesos cluster and perform following
+steps -
+
+1. Install airflow on a machine where webserver and scheduler will run,
+   let's refer this as Airflow server.
+2. On Airflow server, install mesos python eggs from `mesos downloads <http://open.mesosphere.com/downloads/mesos/>`_.
+3. On Airflow server, use a database which can be accessed from mesos 
+   slave machines, for example mysql, and configure in ``airflow.cfg``.
+4. Change your ``airflow.cfg`` to point executor parameter to 
+   MesosExecutor and provide related Mesos settings.
+5. On all mesos slaves, install airflow. Copy the ``airflow.cfg`` from 
+   Airflow server (so that it uses same sql alchemy connection).
+6. On all mesos slaves, run 
+
+.. code-block:: bash
+   
+    airflow serve_logs
+
+for serving logs.
+
+7. On Airflow server, run 
+
+.. code-block:: bash
+
+    airflow scheduler -p
+
+to start processing DAGs and scheduling them on mesos. We need -p parameter to pickle the DAGs.
+
+You can now see the airflow framework and corresponding tasks in mesos UI.
+The logs for airflow tasks can be seen in airflow UI as usual.
+
+For more information about mesos, refer `mesos documentation <http://mesos.apache.org/documentation/latest/>`_.
+For any queries/bugs on MesosExecutor, please contact `@kapil-malik <https://github.com/kapil-malik>`_.
+ 
 
 Web Authentication
 ''''''''''''''''''

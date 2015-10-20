@@ -4,14 +4,11 @@ TODO
 * Backfill form
 * Better task filtering int duration and landing time charts (operator toggle, task regex, uncheck all button)
 * Add templating to adhoc queries
-* is_paused toggle for DAGs
 
 #### Command line
 * Backfill, better logging, prompt with details about what tasks are about to run
 
 #### More Operators!
-* PIG
-* MR
 * Choose and implement a python MR lib
 * Merge Cascading
 
@@ -30,3 +27,6 @@ TODO
 * Pause flag at the task level
 * Task callbacks as tasks?
 * Increase unit test coverage
+
+#### OTher
+deprecate TimeSensor
