@@ -1,5 +1,8 @@
-from __future__ import print_function
+from __future__ import absolute_import
 from __future__ import division
+from __future__ import print_function
+from __future__ import unicode_literals
+
 from builtins import str
 from past.builtins import basestring
 from past.utils import old_div
@@ -59,10 +62,10 @@ if conf.getboolean('webserver', 'AUTHENTICATE'):
     try:
         # Environment specific login
         import airflow_login as login
-    except ImportError:
+    except ImportError as e:
         logging.error(
             "authenticate is set to True in airflow.cfg, "
-            "but airflow_login failed to import")
+            "but airflow_login failed to import %s" % e)
 login_required = login.login_required
 current_user = login.current_user
 logout_user = login.logout_user
@@ -305,7 +308,13 @@ class HomeView(AdminIndexView):
         # filter the dags if filter_by_owner and current user is not superuser
         do_filter = FILTER_BY_OWNER and (not current_user.is_superuser())
         if do_filter:
-            qry = session.query(DM).filter(~DM.is_subdag, DM.is_active, DM.owners == current_user.username).all()
+            qry = (
+                session.query(DM)
+                .filter(
+                    ~DM.is_subdag, DM.is_active,
+                    DM.owners == current_user.username)
+                .all()
+            )
         else:
             qry = session.query(DM).filter(~DM.is_subdag, DM.is_active).all()
         orm_dags = {dag.dag_id: dag for dag in qry}
@@ -319,7 +328,13 @@ class HomeView(AdminIndexView):
         session.close()
         dags = dagbag.dags.values()
         if do_filter:
-            dags = {dag.dag_id: dag for dag in dags if (dag.owner == current_user.username and (not dag.parent_dag))}
+            dags = {
+                dag.dag_id: dag
+                for dag in dags
+                if (
+                    dag.owner == current_user.username and (not dag.parent_dag)
+                )
+            }
         else:
             dags = {dag.dag_id: dag for dag in dags if not dag.parent_dag}
         all_dag_ids = sorted(set(orm_dags.keys()) | set(dags.keys()))
@@ -354,9 +369,9 @@ class Airflow(BaseView):
         session = settings.Session()
         chart_id = request.args.get('chart_id')
         csv = request.args.get('csv') == "true"
-        chart = session.query(models.Chart).filter_by(id=chart_id).all()[0]
+        chart = session.query(models.Chart).filter_by(id=chart_id).first()
         db = session.query(
-            models.Connection).filter_by(conn_id=chart.conn_id).all()[0]
+            models.Connection).filter_by(conn_id=chart.conn_id).first()
         session.expunge_all()
         session.commit()
         session.close()
@@ -630,7 +645,7 @@ class Airflow(BaseView):
         session = settings.Session()
         chart_id = request.args.get('chart_id')
         embed = request.args.get('embed')
-        chart = session.query(models.Chart).filter_by(id=chart_id).all()[0]
+        chart = session.query(models.Chart).filter_by(id=chart_id).first()
         session.expunge_all()
         session.commit()
         session.close()
@@ -664,13 +679,17 @@ class Airflow(BaseView):
             State.QUEUED,
         ]
         task_ids = []
+        dag_ids = []
         for dag in dagbag.dags.values():
             task_ids += dag.task_ids
+            if not dag.is_subdag:
+                dag_ids.append(dag.dag_id)
         TI = models.TaskInstance
         session = Session()
         qry = (
             session.query(TI.dag_id, TI.state, sqla.func.count(TI.task_id))
             .filter(TI.task_id.in_(task_ids))
+            .filter(TI.dag_id.in_(dag_ids))
             .group_by(TI.dag_id, TI.state)
         )
 
@@ -759,7 +778,7 @@ class Airflow(BaseView):
             response=json.dumps(d, indent=4),
             status=200, mimetype="application/json")
 
-    @expose('/login')
+    @expose('/login', methods=['GET', 'POST'])
     def login(self):
         return login.login(self, request)
 
@@ -1548,12 +1567,14 @@ class QueryView(wwwutils.DataProfilingMixin, BaseView):
             db = [db for db in dbs if db.conn_id == conn_id_str][0]
             hook = db.get_hook()
             try:
-                df = hook.get_pandas_df(wwwutils.limit_sql(sql, QUERY_LIMIT, conn_type=db.conn_type))
-                # df = hook.get_pandas_df(sql)
+                df = hook.get_pandas_df(
+                    wwwutils.limit_sql(
+                        sql, QUERY_LIMIT, conn_type=db.conn_type))
                 has_data = len(df) > 0
                 df = df.fillna('')
                 results = df.to_html(
-                    classes="table table-bordered table-striped no-wrap",
+                    classes=[
+                        'table', 'table-bordered', 'table-striped', 'no-wrap'],
                     index=False,
                     na_rep='',
                 ) if has_data else ''
@@ -1779,6 +1800,7 @@ class ConnectionModelView(wwwutils.SuperUserMixin, AirflowModelView):
             ('samba', 'Samba',),
             ('sqlite', 'Sqlite',),
             ('mssql', 'Microsoft SQL Server'),
+            ('mesos_framework-id', 'Mesos Framework ID'),
         ]
     }
 
@@ -1789,6 +1811,10 @@ class ConnectionModelView(wwwutils.SuperUserMixin, AirflowModelView):
                 key:formdata[key]
                 for key in self.form_extra_fields.keys() if key in formdata}
             model.extra = json.dumps(extra)
+
+    @classmethod
+    def alert_fernet_key(cls):
+        return not conf.has_option('core', 'fernet_key')
 
     @classmethod
     def is_secure(self):

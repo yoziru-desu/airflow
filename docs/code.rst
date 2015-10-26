@@ -71,6 +71,7 @@ Operator API
         PythonOperator,
         S3KeySensor,
         S3ToHiveTransfer,
+        ShortCircuitOperator,
         SlackAPIOperator,
         SlackAPIPostOperator,
         SqlSensor,
@@ -160,6 +161,7 @@ Hooks
 .. automodule:: airflow.hooks
     :show-inheritance:
     :members:
+        DbApiHook,
         HiveCliHook,
         HiveMetastoreHook,
         HiveServer2Hook,

@@ -1,3 +1,8 @@
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+from __future__ import unicode_literals
+
 from builtins import str
 from past.builtins import basestring
 from collections import defaultdict
@@ -215,8 +220,8 @@ class SchedulerJob(BaseJob):
             self.num_runs = 1
         else:
             self.num_runs = num_runs
-        self.refresh_dags_every = refresh_dags_every	
-        self.do_pickle = do_pickle	
+        self.refresh_dags_every = refresh_dags_every
+        self.do_pickle = do_pickle
         super(SchedulerJob, self).__init__(*args, **kwargs)
 
         self.heartrate = conf.getint('scheduler', 'SCHEDULER_HEARTBEAT_SEC')
@@ -556,6 +561,10 @@ class SchedulerJob(BaseJob):
                 except Exception as e:
                     logging.exception(e)
                 try:
+                    dagbag.kill_zombies()
+                except Exception as e:
+                    logging.exception(e)
+                try:
                     # We really just want the scheduler to never ever stop.
                     executor.heartbeat()
                     self.heartbeat()
@@ -641,10 +650,11 @@ class BackfillJob(BaseJob):
         while tasks_to_run:
             for key, ti in list(tasks_to_run.items()):
                 ti.refresh_from_db()
-                if ti.state == State.SUCCESS and key in tasks_to_run:
+                if ti.state in (
+                        State.SUCCESS, State.SKIPPED) and key in tasks_to_run:
                     succeeded.append(key)
                     del tasks_to_run[key]
-                elif ti.is_runnable():
+                elif ti.is_runnable(flag_upstream_failed=True):
                     executor.queue_task_instance(
                         ti,
                         mark_success=self.mark_success,
