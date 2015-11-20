@@ -45,7 +45,7 @@ def get_components(principal):
     return re.split('[\/@]', str(principal))
 
 
-def replace_hostname_pattern(components, host):
+def replace_hostname_pattern(components, host=None):
     fqdn = host
     if not fqdn or fqdn == '0.0.0.0':
         fqdn = get_localhost_name()
@@ -72,7 +72,7 @@ def get_fqdn(hostname_or_ip=None):
     return fqdn
 
 def principal_from_username(username):
-    realm = conf.get("security", "default_realm")
+    realm = configuration.get("security", "default_realm")
     if '@' not in username and realm:
         username = "{}@{}".format(username, realm)
 

@@ -4,16 +4,17 @@ from builtins import str
 from builtins import object
 from cgi import escape
 from io import BytesIO as IO
-import gzip
 import functools
-
-from flask import after_this_request, request
-from flask_login import current_user
+import gzip
+import dateutil.parser as dateparser
+import json
+from flask import after_this_request, request, Response
+from flask.ext.login import current_user
 import wtforms
 from wtforms.compat import text_type
 
-from airflow.configuration import conf
-AUTHENTICATE = conf.getboolean('webserver', 'AUTHENTICATE')
+from airflow import configuration, models, settings, utils
+AUTHENTICATE = configuration.getboolean('webserver', 'AUTHENTICATE')
 
 
 class LoginMixin(object):
@@ -67,6 +68,50 @@ def limit_sql(sql, limit, conn_type):
             LIMIT {limit}
             """.format(**locals())
     return sql
+
+
+def action_logging(f):
+    '''
+    Decorator to log user actions
+    '''
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        session = settings.Session()
+
+        if current_user and hasattr(current_user, 'username'):
+            user = current_user.username
+        else:
+            user = 'anonymous'
+
+        log = models.Log(
+                event=f.__name__,
+                task_instance=None,
+                owner=user,
+                extra=str(request.args.items()),
+                task_id=request.args.get('task_id'),
+                dag_id=request.args.get('dag_id'))
+
+        if 'execution_date' in request.args:
+            log.execution_date = dateparser.parse(
+                request.args.get('execution_date'))
+
+        session.add(log)
+        session.commit()
+
+        return f(*args, **kwargs)
+    
+    return wrapper
+
+
+def json_response(obj):
+    """
+    returns a json response from a json serializable python object
+    """
+    return Response(
+        response=json.dumps(
+            obj, indent=4, cls=utils.AirflowJsonEncoder),
+        status=200,
+        mimetype="application/json")
 
 def gzipped(f):
     '''

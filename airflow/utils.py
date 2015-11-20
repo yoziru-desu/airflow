@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import signal
+import six
 import smtplib
 from tempfile import mkdtemp
 
@@ -34,9 +35,10 @@ from sqlalchemy import event, exc
 from sqlalchemy.pool import Pool
 
 import numpy as np
+from croniter import croniter
 
 from airflow import settings
-from airflow.configuration import conf
+from airflow import configuration
 
 
 class AirflowException(Exception):
@@ -83,7 +85,10 @@ class State(object):
 
     @classmethod
     def color(cls, state):
-        return cls.state_color[state]
+        if state in cls.state_color:
+            return cls.state_color[state]
+        else:
+            return 'white'
 
     @classmethod
     def runnable(cls):
@@ -91,6 +96,14 @@ class State(object):
             None, cls.FAILED, cls.UP_FOR_RETRY, cls.UPSTREAM_FAILED,
             cls.SKIPPED]
 
+
+cron_presets = {
+    '@hourly': '0 * * * *',
+    '@daily': '0 0 * * *',
+    '@weekly': '0 0 * * 0',
+    '@monthly': '0 0 1 * *',
+    '@yearly': '0 0 1 1 *',
+}
 
 def provide_session(func):
     """
@@ -140,6 +153,7 @@ def merge_conn(conn, session=None):
 
 def initdb():
     session = settings.Session()
+
     from airflow import models
     upgradedb()
 
@@ -204,6 +218,10 @@ def initdb():
         models.Connection(
             conn_id='vertica_default', conn_type='vertica',
             host='localhost', port=5433))
+    merge_conn(
+        models.Connection(
+            conn_id='webhdfs_default', conn_type='hdfs',
+            host='localhost', port=50070))
 
     # Known event types
     KET = models.KnownEventType
@@ -246,8 +264,8 @@ def upgradedb():
     config = Config(os.path.join(package_dir, 'alembic.ini'))
     config.set_main_option('script_location', directory)
     config.set_main_option('sqlalchemy.url',
-                           conf.get('core', 'SQL_ALCHEMY_CONN'))
-    command.upgrade(config, 'head')
+                           configuration.get('core', 'SQL_ALCHEMY_CONN'))
+    command.upgrade(config, 'heads')
 
 
 def resetdb():
@@ -278,15 +296,69 @@ def validate_key(k, max_length=250):
         return True
 
 
-def date_range(start_date, end_date=datetime.now(), delta=timedelta(1)):
+def date_range(
+        start_date,
+        end_date=None,
+        num=None,
+        delta=None):
+    """
+    Get a set of dates as a list based on a start, end and delta, delta
+    can be something that can be added to ``datetime.datetime``
+    or a cron expression as a ``str``
+
+    :param start_date: anchor date to start the series from
+    :type start_date: datetime.datetime
+    :param end_date: right boundary for the date range
+    :type end_date: datetime.datetime
+    :param num: alternatively to end_date, you can specify the number of
+        number of entries you want in the range. This number can be negative,
+        output will always be sorted regardless
+    :type num: int
+
+    >>> date_range(datetime(2016, 1, 1), datetime(2016, 1, 3), delta=timedelta(1))
+    [datetime.datetime(2016, 1, 1, 0, 0), datetime.datetime(2016, 1, 2, 0, 0), datetime.datetime(2016, 1, 3, 0, 0)]
+    >>> date_range(datetime(2016, 1, 1), datetime(2016, 1, 3), delta='0 0 * * *')
+    [datetime.datetime(2016, 1, 1, 0, 0), datetime.datetime(2016, 1, 2, 0, 0), datetime.datetime(2016, 1, 3, 0, 0)]
+    >>> date_range(datetime(2016, 1, 1), datetime(2016, 3, 3), delta="0 0 0 * *")
+    [datetime.datetime(2016, 1, 1, 0, 0), datetime.datetime(2016, 2, 1, 0, 0), datetime.datetime(2016, 3, 1, 0, 0)]
+    """
+    if not delta:
+        return []
+    if end_date and start_date > end_date:
+        raise Exception("Wait. start_date needs to be before end_date")
+    if end_date and num:
+        raise Exception("Wait. Either specify end_date OR num")
+    if not end_date and not num:
+        end_date = datetime.now()
+
+    delta_iscron = False
+    if isinstance(delta, six.string_types):
+        delta_iscron = True
+        cron = croniter(delta, start_date)
+    elif isinstance(delta, timedelta):
+        delta = abs(delta)
     l = []
-    if end_date >= start_date:
+    if end_date:
         while start_date <= end_date:
             l.append(start_date)
-            start_date += delta
+            if delta_iscron:
+                start_date = cron.get_next(datetime)
+            else:
+                start_date += delta
     else:
-        raise AirflowException("start_date can't be after end_date")
-    return l
+        for i in range(abs(num)):
+            l.append(start_date)
+            if delta_iscron:
+                if num > 0:
+                    start_date = cron.get_next(datetime)
+                else:
+                    start_date = cron.get_prev(datetime)
+            else:
+                if num > 0:
+                    start_date += delta
+                else:
+                    start_date -= delta
+    return sorted(l)
 
 
 def json_ser(obj):
@@ -376,6 +448,9 @@ def apply_defaults(func):
         return result
     return wrapper
 
+if 'BUILDING_AIRFLOW_DOCS' in os.environ:
+    # Monkey patch hook to get good function headers while building docs
+    apply_defaults = lambda x: x
 
 def ask_yesno(question):
     yes = set(['yes', 'y'])
@@ -393,8 +468,13 @@ def ask_yesno(question):
             print("Please respond by yes or no.")
 
 
-def send_email(to, subject, html_content, files=None):
-    SMTP_MAIL_FROM = conf.get('smtp', 'SMTP_MAIL_FROM')
+def send_email(to, subject, html_content, files=None, dryrun=False):
+    """
+    Send an email with html content
+
+    >>> send_email('test@example.com', 'foo', '<b>Foo</b> bar', ['/dev/null'], dryrun=True)
+    """
+    SMTP_MAIL_FROM = configuration.get('smtp', 'SMTP_MAIL_FROM')
 
     if isinstance(to, basestring):
         if ',' in to:
@@ -420,24 +500,25 @@ def send_email(to, subject, html_content, files=None):
                 Name=basename
             ))
 
-    send_MIME_email(SMTP_MAIL_FROM, to, msg)
+    send_MIME_email(SMTP_MAIL_FROM, to, msg, dryrun)
 
 
-def send_MIME_email(e_from, e_to, mime_msg):
-    SMTP_HOST = conf.get('smtp', 'SMTP_HOST')
-    SMTP_PORT = conf.getint('smtp', 'SMTP_PORT')
-    SMTP_USER = conf.get('smtp', 'SMTP_USER')
-    SMTP_PASSWORD = conf.get('smtp', 'SMTP_PASSWORD')
-    SMTP_STARTTLS = conf.getboolean('smtp', 'SMTP_STARTTLS')
+def send_MIME_email(e_from, e_to, mime_msg, dryrun=False):
+    SMTP_HOST = configuration.get('smtp', 'SMTP_HOST')
+    SMTP_PORT = configuration.getint('smtp', 'SMTP_PORT')
+    SMTP_USER = configuration.get('smtp', 'SMTP_USER')
+    SMTP_PASSWORD = configuration.get('smtp', 'SMTP_PASSWORD')
+    SMTP_STARTTLS = configuration.getboolean('smtp', 'SMTP_STARTTLS')
 
-    s = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
-    if SMTP_STARTTLS:
-        s.starttls()
-    if SMTP_USER and SMTP_PASSWORD:
-        s.login(SMTP_USER, SMTP_PASSWORD)
-    logging.info("Sent an alert email to " + str(e_to))
-    s.sendmail(e_from, e_to, mime_msg.as_string())
-    s.quit()
+    if not dryrun:
+        s = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
+        if SMTP_STARTTLS:
+            s.starttls()
+        if SMTP_USER and SMTP_PASSWORD:
+            s.login(SMTP_USER, SMTP_PASSWORD)
+        logging.info("Sent an alert email to " + str(e_to))
+        s.sendmail(e_from, e_to, mime_msg.as_string())
+        s.quit()
 
 
 def import_module_attrs(parent_module_globals, module_attrs_dict):
@@ -556,6 +637,16 @@ def round_time(dt, delta, start_date=datetime.min):
     >>> round_time(datetime(2015, 9, 13, 0, 0), timedelta(1), datetime(2015, 9, 14, 0, 0))
     datetime.datetime(2015, 9, 14, 0, 0)
     """
+
+    if isinstance(delta, six.string_types):
+        # It's cron based, so it's easy
+        cron = croniter(delta, start_date)
+        prev = cron.get_prev(datetime)
+        if prev == start_date:
+            return start_date
+        else:
+            return prev
+
     # Ignore the microseconds of dt
     dt -= timedelta(microseconds = dt.microsecond)
 

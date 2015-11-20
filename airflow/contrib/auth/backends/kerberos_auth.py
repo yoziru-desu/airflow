@@ -14,32 +14,34 @@ from flask import url_for, redirect
 
 from airflow import settings
 from airflow import models
-from airflow.configuration import conf
+from airflow import configuration
 
 import logging
-
-DEFAULT_USERNAME = 'airflow'
 
 login_manager = flask_login.LoginManager()
 login_manager.login_view = 'airflow.login'  # Calls login() bellow
 login_manager.login_message = None
 
+
 class AuthenticationError(Exception):
     pass
 
 
-class User(models.BaseUser):
+class KerberosUser(models.User):
+    def __init__(self, user):
+        self.user = user
+
     @staticmethod
     def authenticate(username, password):
-        service_principal = "%s/%s" % (conf.get('kerberos', 'principal'), utils.get_fqdn())
-        realm = conf.get("kerberos", "default_realm")
+        service_principal = "%s/%s" % (configuration.get('kerberos', 'principal'), utils.get_fqdn())
+        realm = configuration.get("kerberos", "default_realm")
         user_principal = utils.principal_from_username(username)
 
         try:
             # this is pykerberos specific, verify = True is needed to prevent KDC spoofing
             if not kerberos.checkPassword(user_principal, password, service_principal, realm, True):
                 raise AuthenticationError()
-        except kerberos.KrbError, e:
+        except kerberos.KrbError as e:
             logging.error('Password validation for principal %s failed %s', user_principal, e)
             raise AuthenticationError(e)
 
@@ -57,6 +59,10 @@ class User(models.BaseUser):
         '''Required by flask_login'''
         return False
 
+    def get_id(self):
+        '''Returns the current user id as required by flask_login'''
+        return self.user.get_id()
+
     def data_profiling(self):
         '''Provides access to data profiling tools'''
         return True
@@ -65,18 +71,18 @@ class User(models.BaseUser):
         '''Access all the things'''
         return True
 
-models.User = User  # hack!
-del User
-
 
 @login_manager.user_loader
 def load_user(userid):
+    if not userid or userid == 'None':
+        return None
+
     session = settings.Session()
-    user = session.query(models.User).filter(models.User.id == userid).first()
+    user = session.query(models.User).filter(models.User.id == int(userid)).first()
     session.expunge_all()
     session.commit()
     session.close()
-    return user
+    return KerberosUser(user)
 
 
 def login(self, request):
@@ -99,29 +105,30 @@ def login(self, request):
                            form=form)
 
     try:
-        models.User.authenticate(username, password)
+        KerberosUser.authenticate(username, password)
 
         session = settings.Session()
         user = session.query(models.User).filter(
-            models.User.username == DEFAULT_USERNAME).first()
+            models.User.username == username).first()
 
         if not user:
             user = models.User(
-                username=DEFAULT_USERNAME,
-                is_superuser=True)
+                username=username,
+                is_superuser=False)
 
         session.merge(user)
         session.commit()
-        flask_login.login_user(user)
+        flask_login.login_user(KerberosUser(user))
         session.commit()
         session.close()
 
-        return redirect(request.args.get("next") or url_for("index"))
+        return redirect(request.args.get("next") or url_for("admin.index"))
     except AuthenticationError:
         flash("Incorrect login details")
         return self.render('airflow/login.html',
                            title="Airflow - Login",
                            form=form)
+
 
 class LoginForm(Form):
     username = StringField('Username', [InputRequired()])

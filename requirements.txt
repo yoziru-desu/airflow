@@ -5,7 +5,9 @@ chartkick
 cryptography
 coverage
 coveralls
+croniter
 dill
+filechunkio
 flake8
 flask
 flask-admin
@@ -25,6 +27,7 @@ pygments
 pyhive
 pydruid
 PySmbClient
+psycopg2
 python-dateutil
 # pyhs2 -> not compatible with Python 3 because of sasl
 redis
@@ -42,3 +45,7 @@ jaydebeapi
 mysqlclient
 unicodecsv
 slackclient
+ldap3
+Flask-WTF
+lxml
+pykerberos

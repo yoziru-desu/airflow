@@ -55,7 +55,10 @@ Here's the list of the subpackages and what they enable:
 +-------------+------------------------------------+------------------------------------------------+
 |  crypto     | ``pip install airflow[crypto]``    | Encrypt passwords in metadata db               |
 +-------------+------------------------------------+------------------------------------------------+
-
+|  celery     | ``pip install airflow[celery]``    | CeleryExecutor                                 |
++-------------+------------------------------------+------------------------------------------------+
+|  async      | ``pip install airflow[async]``     | Async worker classes for gunicorn              |
++-------------+------------------------------------+------------------------------------------------+
 
 Configuration
 '''''''''''''
@@ -151,6 +154,17 @@ its direction.
 Note that you can also run "Celery Flower", a web UI built on top of Celery,
 to monitor your workers.
 
+Logs
+''''
+Users can specify a logs folder in ``airflow.cfg``. By default, it is in the ``AIRFLOW_HOME`` directory.
+
+In addition, users can supply an S3 location for storing log backups. If logs are not found in the local filesystem (for example, if a worker is lost or reset), the S3 logs will be displayed in the Airflow UI. Note that logs are only sent to S3 once a task completes (including failure).
+
+.. code-block:: bash
+
+    [core]
+    base_log_folder = {AIRFLOW_HOME}/logs
+    s3_log_folder = s3://{YOUR S3 LOG PATH}
 
 Scaling Out on Mesos (community contributed)
 ''''''''''''''''''''''''''''''''''''''''''''
@@ -161,21 +175,21 @@ steps -
 1. Install airflow on a machine where webserver and scheduler will run,
    let's refer this as Airflow server.
 2. On Airflow server, install mesos python eggs from `mesos downloads <http://open.mesosphere.com/downloads/mesos/>`_.
-3. On Airflow server, use a database which can be accessed from mesos 
+3. On Airflow server, use a database which can be accessed from mesos
    slave machines, for example mysql, and configure in ``airflow.cfg``.
-4. Change your ``airflow.cfg`` to point executor parameter to 
+4. Change your ``airflow.cfg`` to point executor parameter to
    MesosExecutor and provide related Mesos settings.
-5. On all mesos slaves, install airflow. Copy the ``airflow.cfg`` from 
+5. On all mesos slaves, install airflow. Copy the ``airflow.cfg`` from
    Airflow server (so that it uses same sql alchemy connection).
-6. On all mesos slaves, run 
+6. On all mesos slaves, run
 
 .. code-block:: bash
-   
+
     airflow serve_logs
 
 for serving logs.
 
-7. On Airflow server, run 
+7. On Airflow server, run
 
 .. code-block:: bash
 
@@ -188,31 +202,3 @@ The logs for airflow tasks can be seen in airflow UI as usual.
 
 For more information about mesos, refer `mesos documentation <http://mesos.apache.org/documentation/latest/>`_.
 For any queries/bugs on MesosExecutor, please contact `@kapil-malik <https://github.com/kapil-malik>`_.
- 
-
-Web Authentication
-''''''''''''''''''
-
-By default, all gates are opened. An easy way to restrict access
-to the web application is to do it at the network level, or by using
-SSH tunnels.
-
-However, it is possible to switch on
-authentication and define exactly how your users should login
-to your Airflow environment. Airflow uses ``flask_login`` and
-exposes a set of hooks in the ``airflow.default_login`` module. You can
-alter the content of this module by overriding it as a ``airflow_login``
-module. To do this, you would typically copy/paste ``airflow.default_login``
-in a ``airflow_login.py`` and put it directly in your ``PYTHONPATH``.
-You also need to set webserver.authenticate as true in your ``airflow.cfg``
-
-
-Multi-tenancy
-'''''''''''''
-
-You can filter the list of dags in webserver by owner name, when authentication
-is turned on, by setting webserver.filter_by_owner as true in your ``airflow.cfg``
-With this, when a user authenticates and logs into webserver, it will see only the dags 
-which it is owner of. A super_user, will be able to see all the dags although.
-This makes the web UI a multi-tenant UI, where a user will only be able to see dags
-created by itself.

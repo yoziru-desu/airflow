@@ -20,12 +20,14 @@
     {% endif %}
     <div class="form-inline">
         <form method="get" style="float:left;">
+            {{ state_token }}
             Run:
             {{ form.execution_date(class_="form-control") | safe }}
             Layout:
             {{ form.arrange(class_="form-control") | safe }}
             <input type="hidden" name="root" value="{{ root }}">
             <input type="hidden" value="{{ dag.dag_id }}" name="dag_id">
+            <input name="_csrf_token" type="hidden" value="{{ csrf_token() }}">
             <input type="submit" value="Go" class="btn btn-default"
             action="" method="get">
         </form>
@@ -43,10 +45,13 @@
     </div>
     {% endfor %}
 
-    <div class="legend_item state" style="border-color:grey;">no status</div>
+    <div style"background-color: blue;">
+    <div class="legend_item state" style="border-color:white;">no status</div>
+    <div class="legend_item state" style="border-color:grey;">queued</div>
     <div class="legend_item state" style="border-color:red;">failed</div>
     <div class="legend_item state" style="border-color:lime;">running</div>
     <div class="legend_item state" style="border-color:green;">success</div>
+    </div>
     <div style="clear:both;"></div>
 </div>
 <hr style="margin-bottom: 0px;"/>
@@ -78,7 +83,9 @@
     var arrange = "{{ arrange }}";
     var g = dagreD3.json.decode(nodes, edges);
     var duration = 500;
-    var stateFocusMap = {'no status':false, 'failed':false, 'running':false, 'success': false}
+    var stateFocusMap = {
+        'no status':false, 'failed':false, 'running':false, 
+        'queued': false, 'success': false};
 
 
     var layout = dagreD3.layout().rankDir(arrange).nodeSep(15).rankSep(15);

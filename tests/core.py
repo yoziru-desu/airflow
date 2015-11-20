@@ -3,16 +3,22 @@ import doctest
 import os
 from time import sleep
 import unittest
+import re
+
 from airflow import configuration
 configuration.test_mode()
 from airflow import jobs, models, DAG, utils, operators, hooks, macros
-from airflow.configuration import conf
-from airflow.www.app import app
+from airflow.hooks import BaseHook
+from airflow.bin import cli
+from airflow.www import app as application
 from airflow.settings import Session
+from lxml import html
 
 NUM_EXAMPLE_DAGS = 7
 DEV_NULL = '/dev/null'
 DEFAULT_DATE = datetime(2015, 1, 1)
+DEFAULT_DATE_ISO = DEFAULT_DATE.isoformat()
+DEFAULT_DATE_DS = DEFAULT_DATE_ISO[:10]
 TEST_DAG_ID = 'unit_tests'
 configuration.test_mode()
 
@@ -23,20 +29,46 @@ except ImportError:
     import pickle
 
 
+def reset():
+    session = Session()
+    tis = session.query(models.TaskInstance).filter_by(dag_id=TEST_DAG_ID)
+    tis.delete()
+    session.commit()
+    session.close()
+
+reset()
+
 class CoreTest(unittest.TestCase):
 
     def setUp(self):
         configuration.test_mode()
         self.dagbag = models.DagBag(
             dag_folder=DEV_NULL, include_examples=True)
-        self.args = {'owner': 'airflow', 'start_date': datetime(2015, 1, 1)}
+        self.args = {'owner': 'airflow', 'start_date': DEFAULT_DATE}
         dag = DAG(TEST_DAG_ID, default_args=self.args)
         self.dag = dag
         self.dag_bash = self.dagbag.dags['example_bash_operator']
         self.runme_0 = self.dag_bash.get_task('runme_0')
 
     def test_confirm_unittest_mod(self):
-        assert configuration.conf.get('core', 'unit_test_mode')
+        assert configuration.get('core', 'unit_test_mode')
+
+    def test_backfill_examples(self):
+        self.dagbag = models.DagBag(
+            dag_folder=DEV_NULL, include_examples=True)
+        dags = [
+            dag for dag in self.dagbag.dags.values()
+            if dag.dag_id in ('example_bash_operator',)]
+        for dag in dags:
+            dag.clear(
+                start_date=DEFAULT_DATE,
+                end_date=DEFAULT_DATE)
+        for dag in dags:
+            job = jobs.BackfillJob(
+                dag=dag,
+                start_date=DEFAULT_DATE,
+                end_date=DEFAULT_DATE)
+            job.run()
 
     def test_pickling(self):
         dp = self.dag.pickle()
@@ -87,22 +119,6 @@ class CoreTest(unittest.TestCase):
         assert hash(self.dag) != hash(dag_diff_name)
         assert hash(self.dag) != hash(dag_subclass)
 
-    def test_cli(self):
-        from airflow.bin import cli
-        parser = cli.get_parser()
-        args = parser.parse_args(['list_dags'])
-        cli.list_dags(args)
-
-        for dag_id in self.dagbag.dags.keys():
-            args = parser.parse_args(['list_tasks', dag_id])
-            cli.list_tasks(args)
-
-        args = parser.parse_args([
-            'list_tasks', 'example_bash_operator', '--tree'])
-        cli.list_tasks(args)
-
-        cli.initdb(parser.parse_args(['initdb']))
-
     def test_time_sensor(self):
         t = operators.TimeSensor(
             task_id='time_sensor_check',
@@ -111,10 +127,17 @@ class CoreTest(unittest.TestCase):
         t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
 
     def test_check_operators(self):
+
+        conn_id = "sqlite_default"
+
+        captainHook = BaseHook.get_hook(conn_id=conn_id)
+        captainHook.run("CREATE TABLE operator_test_table (a, b)")
+        captainHook.run("insert into operator_test_table values (1,2)")
+
         t = operators.CheckOperator(
             task_id='check',
-            sql="SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES",
-            conn_id="mysql_default",
+            sql="select count(*) from operator_test_table" ,
+            conn_id=conn_id,
             dag=self.dag)
         t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
 
@@ -122,10 +145,12 @@ class CoreTest(unittest.TestCase):
             task_id='value_check',
             pass_value=95,
             tolerance=0.1,
-            conn_id="mysql_default",
+            conn_id=conn_id,
             sql="SELECT 100",
             dag=self.dag)
         t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
+
+        captainHook.run("drop table operator_test_table")
 
     def test_clear_api(self):
         task = self.dag_bash.tasks[0]
@@ -139,6 +164,17 @@ class CoreTest(unittest.TestCase):
         t = operators.BashOperator(
             task_id='time_sensor_check',
             bash_command="echo success",
+            dag=self.dag)
+        t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
+
+    def test_trigger_dagrun(self):
+        def trigga(context, obj):
+            if True:
+                return obj
+        t = operators.TriggerDagRunOperator(
+            task_id='test_trigger_dagrun',
+            dag_id='example_bash_operator',
+            python_callable=trigga,
             dag=self.dag)
         t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
 
@@ -184,8 +220,8 @@ class CoreTest(unittest.TestCase):
     def test_timeout(self):
         t = operators.PythonOperator(
             task_id='test_timeout',
-            execution_timeout=timedelta(seconds=2),
-            python_callable=lambda: sleep(10),
+            execution_timeout=timedelta(seconds=1),
+            python_callable=lambda: sleep(5),
             dag=self.dag)
         self.assertRaises(
             utils.AirflowTaskTimeout,
@@ -203,7 +239,6 @@ class CoreTest(unittest.TestCase):
             templates_dict={'ds': "{{ ds }}"},
             dag=self.dag)
         t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
-
 
     def test_complex_template(self):
         class OperatorSubclass(operators.BaseOperator):
@@ -240,21 +275,6 @@ class CoreTest(unittest.TestCase):
         job = jobs.SchedulerJob(dag_id='example_bash_operator', test_mode=True)
         job.run()
 
-    def test_local_backfill_job(self):
-        dags = [
-            dag for dag in self.dagbag.dags.values()
-            if dag.dag_id not in ('example_http_operator',)]
-        for dag in dags:
-            dag.clear(
-                start_date=DEFAULT_DATE,
-                end_date=DEFAULT_DATE)
-        for dag in dags:
-            job = jobs.BackfillJob(
-                dag=dag,
-                start_date=DEFAULT_DATE,
-                end_date=DEFAULT_DATE)
-            job.run()
-
     def test_raw_job(self):
         TI = models.TaskInstance
         ti = TI(
@@ -270,10 +290,70 @@ class CoreTest(unittest.TestCase):
                 raise Exception("Failed a doctest")
 
 
+class CliTests(unittest.TestCase):
+
+    def setUp(self):
+        configuration.test_mode()
+        app = application.create_app()
+        app.config['TESTING'] = True
+        self.parser = cli.get_parser()
+        self.dagbag = models.DagBag(
+            dag_folder=DEV_NULL, include_examples=True)
+
+    def test_cli_list_dags(self):
+        args = self.parser.parse_args(['list_dags'])
+        cli.list_dags(args)
+
+    def test_cli_list_tasks(self):
+        for dag_id in self.dagbag.dags.keys():
+            args = self.parser.parse_args(['list_tasks', dag_id])
+            cli.list_tasks(args)
+
+        args = self.parser.parse_args([
+            'list_tasks', 'example_bash_operator', '--tree'])
+        cli.list_tasks(args)
+
+    def test_cli_initdb(self):
+        cli.initdb(self.parser.parse_args(['initdb']))
+
+    def test_cli_test(self):
+        cli.test(self.parser.parse_args([
+            'test', 'example_bash_operator', 'runme_0',
+            DEFAULT_DATE.isoformat()]))
+        cli.test(self.parser.parse_args([
+            'test', 'example_bash_operator', 'runme_0', '--dry_run',
+            DEFAULT_DATE.isoformat()]))
+
+    def test_cli_run(self):
+        cli.run(self.parser.parse_args([
+            'run', 'example_bash_operator', 'runme_0', '-l',
+            DEFAULT_DATE.isoformat()]))
+
+    def test_task_state(self):
+        cli.task_state(self.parser.parse_args([
+            'task_state', 'example_bash_operator', 'runme_0',
+            DEFAULT_DATE.isoformat()]))
+
+    def test_backfill(self):
+        cli.backfill(self.parser.parse_args([
+            'backfill', 'example_bash_operator',
+            '-s', DEFAULT_DATE.isoformat()]))
+
+        cli.backfill(self.parser.parse_args([
+            'backfill', 'example_bash_operator', '--dry_run',
+            '-s', DEFAULT_DATE.isoformat()]))
+
+        cli.backfill(self.parser.parse_args([
+            'backfill', 'example_bash_operator', '-l',
+            '-s', DEFAULT_DATE.isoformat()]))
+
+
 class WebUiTests(unittest.TestCase):
 
     def setUp(self):
         configuration.test_mode()
+        configuration.conf.set("webserver", "authenticate", "False")
+        app = application.create_app()
         app.config['TESTING'] = True
         self.app = app.test_client()
 
@@ -302,13 +382,20 @@ class WebUiTests(unittest.TestCase):
         response = self.app.get(
             '/admin/airflow/tree?num_runs=25&dag_id=example_bash_operator')
         assert "runme_0" in response.data.decode('utf-8')
+        chartkick_regexp = 'new Chartkick.LineChart\(document.getElementById\(\"chart-\d+\"\),\s+\[["\w\:\s,\{\}\[\]]*\],\s+\{["\w\:\s,\{\}]+\)\;'
         response = self.app.get(
             '/admin/airflow/duration?days=30&dag_id=example_bash_operator')
         assert "example_bash_operator" in response.data.decode('utf-8')
+        chartkick_matched = re.search(chartkick_regexp,
+                                      response.data.decode('utf-8'))
+        assert chartkick_matched is not None
         response = self.app.get(
             '/admin/airflow/landing_times?'
             'days=30&dag_id=example_bash_operator')
         assert "example_bash_operator" in response.data.decode('utf-8')
+        chartkick_matched = re.search(chartkick_regexp,
+                                      response.data.decode('utf-8'))
+        assert chartkick_matched is not None
         response = self.app.get(
             '/admin/airflow/gantt?dag_id=example_bash_operator')
         assert "example_bash_operator" in response.data.decode('utf-8')
@@ -316,49 +403,56 @@ class WebUiTests(unittest.TestCase):
             '/admin/airflow/code?dag_id=example_bash_operator')
         assert "example_bash_operator" in response.data.decode('utf-8')
         response = self.app.get(
+            '/admin/airflow/blocked')
+        response = self.app.get(
             '/admin/configurationview/')
         assert "Airflow Configuration" in response.data.decode('utf-8')
         response = self.app.get(
             '/admin/airflow/rendered?'
             'task_id=runme_1&dag_id=example_bash_operator&'
-            'execution_date=2015-01-07T00:00:00')
-        assert "example_bash_operator__runme_1__20150107" in response.data.decode('utf-8')
+            'execution_date={}'.format(DEFAULT_DATE_ISO))
+        assert "example_bash_operator" in response.data.decode('utf-8')
         response = self.app.get(
             '/admin/airflow/log?task_id=run_this_last&'
-            'dag_id=example_bash_operator&execution_date=2015-01-01T00:00:00')
+            'dag_id=example_bash_operator&execution_date={}'
+            ''.format(DEFAULT_DATE_ISO))
         assert "run_this_last" in response.data.decode('utf-8')
         response = self.app.get(
             '/admin/airflow/task?'
             'task_id=runme_0&dag_id=example_bash_operator&'
-            'execution_date=2015-01-01')
+            'execution_date={}'.format(DEFAULT_DATE_DS))
         assert "Attributes" in response.data.decode('utf-8')
         response = self.app.get(
             '/admin/airflow/dag_stats')
         assert "example_bash_operator" in response.data.decode('utf-8')
+        url = (
+            "/admin/airflow/success?task_id=run_this_last&"
+            "dag_id=example_bash_operator&upstream=false&downstream=false&"
+            "future=false&past=false&execution_date={}&"
+            "origin=/admin".format(DEFAULT_DATE_DS))
+        response = self.app.get(url)
+        assert "Wait a minute" in response.data.decode('utf-8')
+        response = self.app.get(url + "&confirmed=true")
         response = self.app.get(
-            '/admin/airflow/action?action=clear&task_id=run_this_last&'
+            '/admin/airflow/clear?task_id=run_this_last&'
             'dag_id=example_bash_operator&future=true&past=false&'
             'upstream=true&downstream=false&'
-            'execution_date=2015-01-01T00:00:00&'
-            'origin=/admin')
+            'execution_date={}&'
+            'origin=/admin'.format(DEFAULT_DATE_DS))
         assert "Wait a minute" in response.data.decode('utf-8')
-        response = self.app.get(
-            '/admin/airflow/action?action=clear&task_id=run_after_loop&'
-            'dag_id=example_bash_operator&future=false&past=false&'
-            'upstream=false&downstream=true&'
-            'execution_date=2015-01-01T00:00:00&')
         url = (
-            '/admin/airflow/action?action=success&task_id=runme_0&'
-            'dag_id=example_bash_operator&upstream=false&'
-            'downstream=false&execution_date=2017-01-12&'
-            'origin=/admin')
+            "/admin/airflow/clear?task_id=runme_1&"
+            "dag_id=example_bash_operator&future=false&past=false&"
+            "upstream=false&downstream=true&"
+            "execution_date={}&"
+            "origin=/admin".format(DEFAULT_DATE_DS))
         response = self.app.get(url)
         assert "Wait a minute" in response.data.decode('utf-8')
         response = self.app.get(url + "&confirmed=true")
         url = (
-            "/admin/airflow/action?action=run&task_id=runme_0&"
+            "/admin/airflow/run?task_id=runme_0&"
             "dag_id=example_bash_operator&force=true&deps=true&"
-            "execution_date=2015-08-12T00:00:00&origin=/admin")
+            "execution_date={}&origin=/admin".format(DEFAULT_DATE_DS))
         response = self.app.get(url)
         response = self.app.get(
             "/admin/airflow/refresh?dag_id=example_bash_operator")
@@ -386,6 +480,71 @@ class WebUiTests(unittest.TestCase):
     def tearDown(self):
         pass
 
+
+class WebLdapAuthTest(unittest.TestCase):
+
+    def setUp(self):
+        configuration.conf.set("webserver", "authenticate", "True")
+        configuration.conf.set("webserver", "auth_backend", "airflow.contrib.auth.backends.ldap_auth")
+        try:
+            configuration.conf.add_section("ldap")
+        except:
+            pass
+        configuration.conf.set("ldap", "uri", "ldap://localhost:3890")
+        configuration.conf.set("ldap", "user_filter", "objectClass=*")
+        configuration.conf.set("ldap", "user_name_attr", "uid")
+        configuration.conf.set("ldap", "bind_user", "cn=Manager,dc=example,dc=com")
+        configuration.conf.set("ldap", "bind_password", "insecure")
+        configuration.conf.set("ldap", "basedn", "dc=example,dc=com")
+        configuration.conf.set("ldap", "cacert", "")
+
+        app = application.create_app()
+        app.config['TESTING'] = True
+        self.app = app.test_client()
+
+    def get_csrf(self, response):
+        tree = html.fromstring(response.data)
+        form = tree.find('.//form')
+
+        return form.find('.//input[@name="_csrf_token"]').value
+
+    def login(self, username, password):
+        response = self.app.get('/admin/airflow/login')
+        csrf_token = self.get_csrf(response)
+
+        return self.app.post('/admin/airflow/login', data=dict(
+            username=username,
+            password=password,
+            csrf_token=csrf_token
+        ), follow_redirects=True)
+
+    def logout(self):
+        return self.app.get('/admin/airflow/logout', follow_redirects=True)
+
+    def test_login_logout_ldap(self):
+        assert configuration.getboolean('webserver', 'authenticate') is True
+
+        response = self.login('user1', 'userx')
+        assert 'Incorrect login details' in response.data.decode('utf-8')
+
+        response = self.login('userz', 'user1')
+        assert 'Incorrect login details' in response.data.decode('utf-8')
+
+        response = self.login('user1', 'user1')
+        assert 'Data Profiling' in response.data.decode('utf-8')
+
+        response = self.logout()
+        assert 'form-signin' in response.data.decode('utf-8')
+
+    def test_unauthorized(self):
+        response = self.app.get("/admin/airflow/landing_times")
+        self.assertEqual(response.status_code, 302)
+
+    def tearDown(self):
+        configuration.test_mode()
+        configuration.conf.set("webserver", "authenticate", "False")
+
+
 if 'MySqlOperator' in dir(operators):
     # Only testing if the operator is installed
     class MySqlTest(unittest.TestCase):
@@ -395,7 +554,7 @@ if 'MySqlOperator' in dir(operators):
             args = {
                 'owner': 'airflow',
                 'mysql_conn_id': 'airflow_db',
-                'start_date': datetime(2015, 1, 1)
+                'start_date': DEFAULT_DATE
             }
             dag = DAG(TEST_DAG_ID, default_args=args)
             self.dag = dag
@@ -440,6 +599,14 @@ if 'MySqlOperator' in dir(operators):
                 dag=self.dag)
             t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
 
+        def test_sql_sensor(self):
+            t = operators.SqlSensor(
+                task_id='sql_sensor_check',
+                conn_id='mysql_default',
+                sql="SELECT count(1) FROM INFORMATION_SCHEMA.TABLES",
+                dag=self.dag)
+            t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
+
 
 if 'PostgresOperator' in dir(operators):
     # Only testing if the operator is installed
@@ -447,7 +614,7 @@ if 'PostgresOperator' in dir(operators):
 
         def setUp(self):
             configuration.test_mode()
-            args = {'owner': 'airflow', 'start_date': datetime(2015, 1, 1)}
+            args = {'owner': 'airflow', 'start_date': DEFAULT_DATE}
             dag = DAG(TEST_DAG_ID, default_args=args)
             self.dag = dag
 
@@ -476,7 +643,7 @@ class HttpOpSensorTest(unittest.TestCase):
 
     def setUp(self):
         configuration.test_mode()
-        args = {'owner': 'airflow', 'start_date': datetime(2015, 1, 1)}
+        args = {'owner': 'airflow', 'start_date': DEFAULT_DATE_ISO}
         dag = DAG(TEST_DAG_ID, default_args=args)
         self.dag = dag
 
@@ -513,21 +680,6 @@ class HttpOpSensorTest(unittest.TestCase):
             timeout=15,
             dag=self.dag)
         sensor.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
-
-    def test_sensor_timeout(self):
-        sensor = operators.HttpSensor(
-            task_id='http_sensor_check',
-            conn_id='http_default',
-            endpoint='/search',
-            params={"client": "ubuntu", "q": "airflow"},
-            headers={},
-            response_check=lambda response: ("dingdong" in response.text),
-            poke_interval=2,
-            timeout=5,
-            dag=self.dag)
-        with self.assertRaises(utils.AirflowSensorTimeout):
-            sensor.run(
-                start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
 
 
 class ConnectionTest(unittest.TestCase):
@@ -587,6 +739,21 @@ class ConnectionTest(unittest.TestCase):
         del os.environ['AIRFLOW_CONN_AIRFLOW_DB']
 
 
+@unittest.skipUnless("S3Hook" in dir(hooks),
+                     "Skipping test because S3Hook is not installed")
+class S3HookTest(unittest.TestCase):
+
+    def setUp(self):
+        configuration.test_mode()
+        self.s3_test_url = "s3://test/this/is/not/a-real-key.txt"
+
+    def test_parse_s3_url(self):
+        parsed = hooks.S3Hook.parse_s3_url(self.s3_test_url)
+        self.assertEqual(parsed,
+                         ("test", "this/is/not/a-real-key.txt"),
+                         "Incorrect parsing of the s3 url")
+
+
 if 'AIRFLOW_RUNALL_TESTS' in os.environ:
 
 
@@ -594,7 +761,7 @@ if 'AIRFLOW_RUNALL_TESTS' in os.environ:
 
         def setUp(self):
             configuration.test_mode()
-            args = {'owner': 'airflow', 'start_date': datetime(2015, 1, 1)}
+            args = {'owner': 'airflow', 'start_date': DEFAULT_DATE_ISO}
             dag = DAG(TEST_DAG_ID, default_args=args)
             self.dag = dag
 
@@ -619,18 +786,17 @@ if 'AIRFLOW_RUNALL_TESTS' in os.environ:
                 mysql_conn_id='airflow_db',
                 sql=sql,
                 hive_table='airflow.test_mysql_to_hive_part',
-                partition={'ds': '2015-01-02'},
+                partition={'ds': DEFAULT_DATE_DS},
                 recreate=False,
                 create=True,
                 dag=self.dag)
             t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
 
-
     class HivePrestoTest(unittest.TestCase):
 
         def setUp(self):
             configuration.test_mode()
-            args = {'owner': 'airflow', 'start_date': datetime(2015, 1, 1)}
+            args = {'owner': 'airflow', 'start_date': DEFAULT_DATE}
             dag = DAG(TEST_DAG_ID, default_args=args)
             self.dag = dag
             self.hql = """
@@ -679,6 +845,14 @@ if 'AIRFLOW_RUNALL_TESTS' in os.environ:
                 dag=self.dag)
             t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
 
+        def test_webhdfs_sensor(self):
+            t = operators.WebHdfsSensor(
+                task_id='webhdfs_sensor_check',
+                filepath='hdfs://user/hive/warehouse/airflow.db/static_babynames',
+                timeout=120,
+                dag=self.dag)
+            t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
+
         def test_sql_sensor(self):
             t = operators.SqlSensor(
                 task_id='hdfs_sensor_check',
@@ -691,7 +865,7 @@ if 'AIRFLOW_RUNALL_TESTS' in os.environ:
             t = operators.HiveStatsCollectionOperator(
                 task_id='hive_stats_check',
                 table="airflow.static_babynames_partitioned",
-                partition={'ds': '2015-01-01'},
+                partition={'ds': DEFAULT_DATE_DS},
                 dag=self.dag)
             t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
 
@@ -699,6 +873,14 @@ if 'AIRFLOW_RUNALL_TESTS' in os.environ:
             t = operators.HivePartitionSensor(
                 task_id='hive_partition_check',
                 table='airflow.static_babynames_partitioned',
+                dag=self.dag)
+            t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
+
+        def test_hive_metastore_sql_sensor(self):
+            t = operators.MetastorePartitionSensor(
+                task_id='hive_partition_check',
+                table='airflow.static_babynames_partitioned',
+                partition_name='ds={}'.format(DEFAULT_DATE_DS),
                 dag=self.dag)
             t.run(start_date=DEFAULT_DATE, end_date=DEFAULT_DATE, force=True)
 
